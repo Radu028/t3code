@@ -792,7 +792,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
           ref={tabListRef}
           hideScrollbars
           scrollFade
-          className={cn("min-w-0 flex-1 rounded-none", ownsDesktopTitleBar && "drag-region")}
+          className={cn(
+            "min-w-0 flex-1 rounded-none",
+            ownsDesktopTitleBar && "[-webkit-app-region:no-drag]",
+          )}
           data-right-panel-tab-list
         >
           <div className="flex h-full w-max min-w-full items-center gap-1">
@@ -924,6 +927,9 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                   })}
                 </MenuPopup>
               </Menu>
+            ) : null}
+            {ownsDesktopTitleBar ? (
+              <div aria-hidden className="drag-region -ml-1 h-full flex-1" />
             ) : null}
           </div>
         </ScrollArea>

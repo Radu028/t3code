@@ -1,6 +1,6 @@
 import type { DesktopPreviewFavicon, PreviewSessionSnapshot } from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   RightPanelTabs,
@@ -8,6 +8,10 @@ import {
   surfaceShortcutTargetsTypingContext,
   tabMuteMenuItem,
 } from "./RightPanelTabs";
+
+// Inline mode on desktop owns the window title bar, which is where the tab
+// strip has to stay scrollable while the unused space stays draggable.
+vi.mock("~/env", () => ({ isElectron: true }));
 
 function shortcutEvent(
   key: string,
@@ -265,5 +269,16 @@ describe("tabMuteMenuItem", () => {
       label: "Unmute tab",
       disabled: false,
     });
+  });
+});
+
+describe("RightPanelTabs desktop title bar", () => {
+  it("keeps the tab strip out of the drag region and restores drag on the trailing space", () => {
+    const html = renderTabs(null);
+    const tabList = html.match(/<div[^>]*data-right-panel-tab-list[^>]*>/)?.[0];
+
+    expect(tabList).toContain("[-webkit-app-region:no-drag]");
+    expect(tabList).not.toContain("drag-region");
+    expect(html).toMatch(/<div aria-hidden="true" class="drag-region[^"]*"><\/div>/);
   });
 });
