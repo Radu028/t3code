@@ -497,8 +497,8 @@ function resolveCommandCandidates(
 }
 
 // Session bootstrap resolves the same commands over and over, each PATH scan
-// costing hundreds of 'shell.isExecutableFile' filesystem probes (tens of
-// thousands per connect). Memoize the scan outcome per
+// costing hundreds of filesystem probes (tens of thousands per connect).
+// Memoize the scan outcome per
 // (platform, PATH, PATHEXT, command) for a short window: repeat scans hit the
 // cache while any change to the search environment invalidates immediately.
 // Explicit-path resolution is never cached - callers probe paths they have
@@ -544,7 +544,7 @@ function cacheCommandResolution(
   });
 }
 
-const isExecutableFile = Effect.fn("shell.isExecutableFile")(function* (
+const isExecutableFile = Effect.fnUntraced(function* (
   filePath: string,
   platform: NodeJS.Platform,
   windowsPathExtensions: ReadonlyArray<string>,

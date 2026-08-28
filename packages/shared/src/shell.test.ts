@@ -2,10 +2,12 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as Tracer from "effect/Tracer";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   extractPathFromShellOutput,
+  CommandResolutionCache,
   CommandAvailability,
   type CommandAvailabilityChecker,
   isCommandAvailable,
@@ -373,6 +375,34 @@ effectIt.layer(NodeServices.layer)("resolveCommandPath", (it) => {
       }).pipe(Effect.provideService(HostProcessPlatform, "win32"), Effect.result);
 
       expect(result._tag).toBe("Failure");
+    }),
+  );
+
+  it.effect("does not trace individual filesystem candidates", () =>
+    Effect.gen(function* () {
+      const spanNames: Array<string> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spanNames.push(span.name);
+          return span;
+        },
+      });
+
+      const result = yield* resolveCommandPath("definitely-not-installed", {
+        env: { PATH: "C:\\first;C:\\second", PATHEXT: ".EXE;.CMD" },
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(CommandResolutionCache, new Map()),
+        Effect.withTracer(tracer),
+        Effect.result,
+      );
+
+      expect(result._tag).toBe("Failure");
+      expect(spanNames).toEqual(
+        expect.arrayContaining(["shell.resolveCommandPath", "shell.resolveCommandPathForPlatform"]),
+      );
+      expect(spanNames).not.toContain("shell.isExecutableFile");
     }),
   );
 });
