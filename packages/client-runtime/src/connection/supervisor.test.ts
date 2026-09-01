@@ -994,10 +994,19 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
-  it.effect("uses the full tolerance window for a stalled desktop foreground probe", () =>
+  it.effect("reconnects only after consecutive desktop foreground probe timeouts", () =>
     Effect.gen(function* () {
+      const firstProbeStarted = yield* Deferred.make<void>();
+      const secondProbeStarted = yield* Deferred.make<void>();
+      const probeCount = yield* Ref.make(0);
       const harness = yield* makeHarness({
-        probe: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
+        probe: () =>
+          Ref.updateAndGet(probeCount, (count) => count + 1).pipe(
+            Effect.tap((count) =>
+              Deferred.succeed(count === 1 ? firstProbeStarted : secondProbeStarted, undefined),
+            ),
+            Effect.andThen(Effect.never),
+          ),
       });
       const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
         initiallyDesired: true,
@@ -1005,15 +1014,71 @@ describe("EnvironmentSupervisor", () => {
 
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");
       yield* harness.wake("application-active");
+      yield* Deferred.await(firstProbeStarted);
       yield* TestClock.adjust("14999 millis");
       expect(yield* Ref.get(harness.sessionCount)).toBe(1);
       yield* TestClock.adjust("1 milli");
+      yield* Effect.yieldNow;
+
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connected");
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+      expect(yield* Ref.get(harness.releaseCount)).toBe(0);
+
+      yield* harness.wake("application-active");
+      yield* Deferred.await(secondProbeStarted);
+      yield* TestClock.adjust("15 seconds");
       yield* awaitState(
         supervisor.state,
         (state) => state.phase === "connected" && state.generation === 2 && state.attempt === 1,
       );
 
       expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("resets the desktop foreground probe timeout count after a successful probe", () =>
+    Effect.gen(function* () {
+      const firstProbeStarted = yield* Deferred.make<void>();
+      const secondProbeStarted = yield* Deferred.make<void>();
+      const thirdProbeStarted = yield* Deferred.make<void>();
+      const probeCount = yield* Ref.make(0);
+      const harness = yield* makeHarness({
+        probe: () =>
+          Ref.updateAndGet(probeCount, (count) => count + 1).pipe(
+            Effect.tap((count) =>
+              count === 1
+                ? Deferred.succeed(firstProbeStarted, undefined)
+                : count === 2
+                  ? Deferred.succeed(secondProbeStarted, undefined)
+                  : count === 3
+                    ? Deferred.succeed(thirdProbeStarted, undefined)
+                    : Effect.void,
+            ),
+            Effect.flatMap((count) => (count === 2 ? Effect.void : Effect.never)),
+          ),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-active");
+      yield* Deferred.await(firstProbeStarted);
+      yield* TestClock.adjust("15 seconds");
+
+      yield* harness.wake("application-active");
+      yield* Deferred.await(secondProbeStarted);
+      yield* Effect.yieldNow;
+
+      yield* harness.wake("application-active");
+      yield* Deferred.await(thirdProbeStarted);
+      yield* TestClock.adjust("15 seconds");
+      yield* Effect.yieldNow;
+
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connected");
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+      expect(yield* Ref.get(harness.releaseCount)).toBe(0);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
