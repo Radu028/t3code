@@ -773,6 +773,57 @@ describe("collectLimitNotices", () => {
       "hub: Usage is out of date.",
     ]);
   });
+
+  it("does not report unsupported hub accounts as failed reads", () => {
+    const view = new Map([
+      [
+        EnvironmentId.make("remote"),
+        {
+          ...laptop,
+          serverConfig: {
+            usageLimitSources: [
+              {
+                ...hub,
+                accounts: [
+                  {
+                    id: "api-key-account",
+                    driver: claude,
+                    usageLimits: {
+                      checkedAt,
+                      windows: [],
+                      unavailable: { reason: "unsupported" as const },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    ]);
+    expect(collectLimitNotices(view, Date.parse(checkedAt))).toEqual([]);
+  });
+
+  it.each([undefined, "The hub could not list accounts."])(
+    "marks stale empty snapshots, including failed reads, as out of date",
+    (error) => {
+      const view = new Map([
+        [
+          EnvironmentId.make("remote"),
+          {
+            ...laptop,
+            serverConfig: { usageLimitSources: [{ ...hub, ...(error ? { error } : {}) }] },
+          },
+        ],
+      ]);
+      const notice = `hub: ${error ?? "No accounts reported."}`;
+      expect(collectLimitNotices(view, Date.parse(checkedAt))).toEqual([notice]);
+      expect(collectLimitNotices(view, Date.parse(checkedAt) + 120_000)).toEqual([
+        notice,
+        "hub: Usage is out of date.",
+      ]);
+    },
+  );
 });
 
 describe("/usage-limits", () => {
