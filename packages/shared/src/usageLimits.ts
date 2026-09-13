@@ -258,9 +258,7 @@ export function collectLimitNotices(
         notices.push(`${label(environmentLabel, source.label)}: No accounts reported.`);
       } else {
         const failures = source.accounts.filter(
-          (account) =>
-            account.usageLimits.unavailable?.reason !== "unsupported" &&
-            limitsNotice(account.usageLimits) !== null,
+          (account) => account.usageLimits.unavailable?.reason === "probeFailed",
         );
         if (failures.length > 0) {
           notices.push(

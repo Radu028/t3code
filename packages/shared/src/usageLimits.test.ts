@@ -774,35 +774,38 @@ describe("collectLimitNotices", () => {
     ]);
   });
 
-  it("does not report unsupported hub accounts as failed reads", () => {
-    const view = new Map([
-      [
-        EnvironmentId.make("remote"),
-        {
-          ...laptop,
-          serverConfig: {
-            usageLimitSources: [
-              {
-                ...hub,
-                accounts: [
-                  {
-                    id: "api-key-account",
-                    driver: claude,
-                    usageLimits: {
-                      checkedAt,
-                      windows: [],
-                      unavailable: { reason: "unsupported" as const },
+  it.each([undefined, { reason: "unsupported" as const }])(
+    "does not report unsupported or empty hub accounts as failed reads",
+    (unavailable) => {
+      const view = new Map([
+        [
+          EnvironmentId.make("remote"),
+          {
+            ...laptop,
+            serverConfig: {
+              usageLimitSources: [
+                {
+                  ...hub,
+                  accounts: [
+                    {
+                      id: "api-key-account",
+                      driver: claude,
+                      usageLimits: {
+                        checkedAt,
+                        windows: [],
+                        ...(unavailable ? { unavailable } : {}),
+                      },
                     },
-                  },
-                ],
-              },
-            ],
+                  ],
+                },
+              ],
+            },
           },
-        },
-      ],
-    ]);
-    expect(collectLimitNotices(view, Date.parse(checkedAt))).toEqual([]);
-  });
+        ],
+      ]);
+      expect(collectLimitNotices(view, Date.parse(checkedAt))).toEqual([]);
+    },
+  );
 
   it.each([undefined, "The hub could not list accounts."])(
     "marks stale empty snapshots, including failed reads, as out of date",
