@@ -543,7 +543,7 @@ export function UsageLimitsPooled({
   readonly now: number;
 }) {
   const pools = collectLimitPools(collectLimitAccounts(presentations), now);
-  const notices = collectLimitNotices(presentations);
+  const notices = collectLimitNotices(presentations, now);
   return (
     <div className="flex flex-col gap-8">
       {pools.length === 0 && notices.length === 0 ? (

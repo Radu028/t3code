@@ -740,6 +740,39 @@ describe("collectLimitNotices", () => {
     });
     expect(collectLimitNotices(one)[0]).toBe("Laptop · Claude Max: Could not read limits.");
   });
+  it("labels old hub snapshots and per-account failures without exposing account identity", () => {
+    const view = new Map([
+      [
+        EnvironmentId.make("remote"),
+        {
+          ...laptop,
+          serverConfig: {
+            usageLimitSources: [
+              {
+                ...hub,
+                accounts: [
+                  {
+                    id: "private-account",
+                    email: "private@example.com",
+                    driver: claude,
+                    usageLimits: {
+                      checkedAt,
+                      windows: [],
+                      unavailable: { reason: "probeFailed" as const },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    ]);
+    expect(collectLimitNotices(view, Date.parse(checkedAt) + 120_000)).toEqual([
+      "hub: Could not read limits for 1 account.",
+      "hub: Usage is out of date.",
+    ]);
+  });
 });
 
 describe("/usage-limits", () => {

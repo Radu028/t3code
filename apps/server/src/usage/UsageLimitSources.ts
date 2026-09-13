@@ -3,7 +3,8 @@
  * on, today a CLIProxyAPI hub pooling several subscription accounts.
  *
  * Each configured `settings.usageLimitSources` entry is polled on the
- * provider health-check interval and on every settings change, then
+ * provider health-check interval, on settings changes, and when a client
+ * subscribes to an expired snapshot, then
  * published as one snapshot per source over `subscribeServerConfig`. A source
  * that fails keeps its row with `error` set so the user can see it is
  * configured but unreachable. Nothing is persisted: like provider status,
@@ -22,6 +23,8 @@ import {
   type UsageLimitSourceSnapshot,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
+import { USAGE_LIMITS_MAX_AGE_MS } from "@t3tools/shared/usageLimits";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -100,7 +103,8 @@ export const make = Effect.gen(function* () {
   // must not publish after the change's own refresh and resurrect a removed
   // source. Callers queue behind the in-flight run and see current settings.
   const refreshLock = yield* Semaphore.make(1);
-  const refresh = Effect.gen(function* () {
+  let lastRefresh = -Infinity;
+  const readSources = Effect.gen(function* () {
     const settings = yield* settingsService.getSettings.pipe(
       Effect.orElseSucceed((): ServerSettings | null => null),
     );
@@ -113,6 +117,15 @@ export const make = Effect.gen(function* () {
       { concurrency: 4 },
     );
     yield* publish(snapshots);
+    lastRefresh = yield* Clock.currentTimeMillis;
+  });
+  const refresh = readSources.pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
+  // Reconnecting clients need a fresh read even when background work is paused.
+  // Check inside the lock so simultaneous subscriptions share the same read.
+  const refreshIfStale = Effect.gen(function* () {
+    if ((yield* Clock.currentTimeMillis) - lastRefresh >= USAGE_LIMITS_MAX_AGE_MS) {
+      yield* readSources;
+    }
   }).pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
 
   // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
@@ -172,6 +185,7 @@ export const make = Effect.gen(function* () {
       return Stream.unwrap(
         Effect.gen(function* () {
           const subscription = yield* PubSub.subscribe(changes);
+          yield* refreshIfStale.pipe(Effect.forkScoped);
           const snapshot = yield* Ref.get(stateRef);
           return Stream.concat(Stream.make(snapshot), Stream.fromSubscription(subscription)).pipe(
             Stream.changes,

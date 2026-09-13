@@ -85,6 +85,8 @@ import { UsagePage } from "./UsagePage";
 let renderer: ReactTestRenderer;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("document", Object.assign(new EventTarget(), { visibilityState: "visible" }));
+  vi.stubGlobal("window", new EventTarget());
   vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-11T12:00:00Z"));
   state.refreshProviders.mockClear();
   state.presentations = new Map([
@@ -175,5 +177,21 @@ it("uses the current time when returning to limits from tokens", async () => {
   expect(
     JSON.stringify(renderer.toJSON(), (key, value) => (key === "props" ? undefined : value)),
   ).toContain("in 1h 0m");
+  expect(state.refreshProviders).toHaveBeenCalledWith({ environmentId: "test", input: {} });
+});
+
+it("does no hidden work and refreshes stale limits after resume", async () => {
+  Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+  vi.mocked(Date.now).mockReturnValue(Date.parse("2026-09-11T14:00:00Z"));
+  await act(() => {
+    renderer = create(<UsagePage />);
+  });
   expect(state.refreshProviders).not.toHaveBeenCalled();
+  await act(async () => {
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(state.refreshProviders).toHaveBeenCalledTimes(1);
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(state.refreshProviders).toHaveBeenCalledTimes(1);
 });

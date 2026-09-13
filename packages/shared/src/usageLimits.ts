@@ -24,6 +24,13 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
+export const USAGE_LIMITS_MAX_AGE_MS = MINUTE;
+
+export function usageLimitsAreStale(checkedAt: string, now: number): boolean {
+  const checked = Date.parse(checkedAt);
+  return !Number.isFinite(checked) || now - checked >= USAGE_LIMITS_MAX_AGE_MS;
+}
+
 /**
  * Providers that belong on the Limits view: enabled, installed, and one whose
  * driver reports subscription usage at all. A driver with no notion of usage
@@ -220,7 +227,10 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
  * are left out; there is nothing for the user to act on. The environment
  * is named only when more than one is connected.
  */
-export function collectLimitNotices(presentations: LimitPresentations): readonly string[] {
+export function collectLimitNotices(
+  presentations: LimitPresentations,
+  now?: number,
+): readonly string[] {
   const label = (environmentLabel: string, subject: string) =>
     presentations.size > 1 ? `${environmentLabel} · ${subject}` : subject;
   const notices: string[] = [];
@@ -233,12 +243,31 @@ export function collectLimitNotices(presentations: LimitPresentations): readonly
       const notice = provider.usageLimits ? limitsNotice(provider.usageLimits) : null;
       const name = provider.displayName?.trim() || String(provider.driver);
       if (notice) notices.push(`${label(environmentLabel, name)}: ${notice}`);
+      else if (
+        now !== undefined &&
+        provider.usageLimits &&
+        usageLimitsAreStale(provider.usageLimits.checkedAt, now)
+      ) {
+        notices.push(`${label(environmentLabel, name)}: Usage is out of date.`);
+      }
     }
     for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
       if (source.error) {
         notices.push(`${label(environmentLabel, source.label)}: ${source.error}`);
       } else if (source.accounts.length === 0) {
         notices.push(`${label(environmentLabel, source.label)}: No accounts reported.`);
+      } else {
+        const failures = source.accounts.filter(
+          (account) => limitsNotice(account.usageLimits) !== null,
+        );
+        if (failures.length > 0) {
+          notices.push(
+            `${label(environmentLabel, source.label)}: Could not read limits for ${failures.length} ${failures.length === 1 ? "account" : "accounts"}.`,
+          );
+        }
+        if (now !== undefined && usageLimitsAreStale(source.checkedAt, now)) {
+          notices.push(`${label(environmentLabel, source.label)}: Usage is out of date.`);
+        }
       }
     }
   }

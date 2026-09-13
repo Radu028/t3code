@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   UsageDay,
+  UsageLimitSourceId,
   USAGE_CONTRACT_VERSION,
   type UsageSummary,
 } from "@t3tools/contracts";
@@ -10,7 +11,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import type { EnvironmentPresentation } from "../connection/presentation.ts";
 import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
-import { refreshUsage } from "./usage.ts";
+import { createUsageLimitsRefresher, refreshUsage } from "./usage.ts";
 
 const input = {
   sinceDay: UsageDay.make("2026-09-05"),
@@ -180,5 +181,64 @@ describe("manual usage refresh", () => {
     await refreshing;
     expect(reads).toBe(2);
     unmount();
+  });
+});
+
+describe("visible subscription limits", () => {
+  const now = Date.parse("2026-09-13T12:00:00Z");
+  const old = new Date(now - 2 * 60 * 60_000).toISOString();
+  const presentation = (checkedAt: string) => ({
+    entry: { target: { label: "Test" } },
+    serverConfig: {
+      usageLimitSources: [
+        {
+          id: UsageLimitSourceId.make("hub"),
+          kind: "cliproxy" as const,
+          label: "Hub",
+          checkedAt,
+          accounts: [],
+        },
+      ],
+    },
+  });
+
+  it("refreshes stale environments independently and leaves fresh snapshots alone", async () => {
+    const a = EnvironmentId.make("a"),
+      b = EnvironmentId.make("b");
+    const calls: EnvironmentId[] = [];
+    const refresh = createUsageLimitsRefresher(async (id) => {
+      calls.push(id);
+    });
+    await refresh(
+      new Map([
+        [a, presentation(old)],
+        [b, presentation(new Date(now).toISOString())],
+      ]),
+      now,
+    );
+    expect(calls).toEqual([a]);
+    await refresh(new Map([[b, presentation(old)]]), now);
+    expect(calls).toEqual([a, b]);
+  });
+
+  it("coalesces reconnect and resume during an outstanding request, then retries after failure", async () => {
+    const id = EnvironmentId.make("remote");
+    const done = Promise.withResolvers<void>();
+    let calls = 0;
+    const refresh = createUsageLimitsRefresher(() => {
+      calls++;
+      return done.promise;
+    });
+    const views = new Map([[id, presentation(old)]]);
+    const first = refresh(views, now);
+    const reconnect = refresh(views, now + 1);
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    done.reject(new Error("disconnected"));
+    await Promise.all([first, reconnect]);
+    await refresh(views, now + 59_999);
+    expect(calls).toBe(1);
+    await refresh(views, now + 60_000);
+    expect(calls).toBe(2);
   });
 });
