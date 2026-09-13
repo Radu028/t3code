@@ -110,3 +110,12 @@ export const PREVIEW_POINTER_EVENT_CHANNEL = "desktop:preview-pointer-event";
 export const MAC_PERMISSION_HELPER_CHANNEL = "desktop:mac-permission-helper";
 
 export const CHECK_SYSTEM_PERMISSION_CHANNEL = "desktop:check-system-permission";
+
+export const BROWSER_MOUNT_CHANNEL = "desktop:browser-mount";
+export const BROWSER_LAYOUT_CHANNEL = "desktop:browser-layout";
+export const BROWSER_INTERACT_CHANNEL = "desktop:browser-interact";
+export const BROWSER_VIEWPORT_CHANNEL = "desktop:browser-viewport";
+export const BROWSER_STREAM_CHANNEL = "desktop:browser-stream";
+
+export const BROWSER_MOTION_CHANNEL = "desktop:browser-motion";
+export const BROWSER_CURSOR_CHANNEL = "desktop:browser-cursor";
