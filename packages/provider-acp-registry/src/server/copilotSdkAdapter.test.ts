@@ -111,6 +111,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   // Each held list answers one tasks.list call, in order.
   const listGates: Array<Promise<void>> = [];
   let sendGate: Promise<void> | undefined;
+  let rejectSend: ((cause: Error) => void) | undefined;
   let exitGate: Promise<void> | undefined;
   // Each held drain gates one waitForPending call, in order.
   const drainGates: Array<Promise<void>> = [];
@@ -129,7 +130,13 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
     sessionId,
     send: async (options) => {
       record("send", options);
-      await sendGate;
+      // Like the SDK, forceStop disconnects and so rejects a send Copilot has not answered.
+      await Promise.race([
+        sendGate,
+        new Promise<never>((_, reject) => {
+          rejectSend = reject;
+        }),
+      ]);
       return "steer-message";
     },
     sendAndWait: (options, timeout) => {
@@ -242,6 +249,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       forceStop: async () => {
         record("forceStop");
         finishRun?.(new Error("Session disconnected while waiting for a response"));
+        rejectSend?.(new Error("Pending response rejected since connection got disposed"));
         if (stopFails) {
           throw new Error("Timed out waiting for CLI process to exit after SIGKILL: 10000ms");
         }
@@ -279,6 +287,10 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       const held = gate();
       drainGates.push(held.promise);
       return held.release;
+    },
+    /** The next waitForPending call never answers, though the connection stays open. */
+    hangDrain: () => {
+      drainGates.push(new Promise<void>(() => {}));
     },
     failTaskLists: (count: number) => {
       failedLists = count;
@@ -319,6 +331,10 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       listGates.push(new Promise<void>(() => {}));
     },
     hasExited: () => hasExitedNow(),
+    /** Copilot never acknowledges the next steer. */
+    hangSend: () => {
+      sendGate = new Promise<void>(() => {});
+    },
     holdSend: () => {
       let release!: () => void;
       sendGate = new Promise((resolve) => {
@@ -777,6 +793,25 @@ describe("CopilotSdkAdapterV2", () => {
         status: "failed",
         threadDisposition: "broken",
       });
+
+      // A rate limit, then the CLI exits before the request settles: the turn keeps the usage
+      // limit, and the process is still gone.
+      yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, [], 4));
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.emit({
+        ...event,
+        type: "session.error",
+        data: { errorType: "rate_limit", message: "Rate limit exceeded", statusCode: 429 },
+      });
+      yield* fake.exitProcess();
+      const exited = (yield* harness.untilTerminal()).at(-1);
+      if (exited?.type !== "turn.terminal" || exited.status !== "failed") {
+        return assert.fail("expected a failed turn");
+      }
+      assert.strictEqual(exited.threadDisposition, "broken");
+      assert.strictEqual(exited.failure.class, "usage_limit");
+      assert.strictEqual(exited.failure.message, "Rate limit exceeded");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -803,6 +838,35 @@ describe("CopilotSdkAdapterV2", () => {
       yield* fake.takeCall("abort");
       const terminal = (yield* harness.untilTerminal()).at(-1);
       assert.deepInclude(terminal, { type: "turn.terminal", status: "interrupted" });
+
+      // A steer Copilot never acknowledges must not keep Stop from aborting, then killing.
+      fake.hangSend();
+      const second = yield* turnInput(running, [], 2);
+      yield* harness.runtime.startTurn(second);
+      const secondTurn = (yield* harness.takeRunningTurn()).id;
+      yield* fake.takeCall("sendAndWait");
+      const steering = yield* harness.runtime
+        .steerTurn({
+          threadId: THREAD_ID,
+          runId: second.runId,
+          providerThread: running,
+          providerTurnId: secondTurn,
+          message: { ...second.message, messageId: MessageId.make("steer-2"), text: "Faster" },
+        })
+        .pipe(Effect.forkScoped);
+      yield* fake.takeCall("send");
+      const stopping = yield* harness.runtime
+        .interruptTurn({ providerThread: running, providerTurnId: secondTurn })
+        .pipe(Effect.forkScoped);
+      yield* fake.takeCall("abort");
+      yield* TestClock.adjust("30 seconds");
+      yield* Fiber.join(stopping);
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "interrupted",
+        threadDisposition: "broken",
+      });
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(steering)));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -1079,7 +1143,9 @@ describe("CopilotSdkAdapterV2", () => {
       assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
 
       // A task list Copilot cannot return gets a few fresh drains. A shell may still be running
-      // then, so T3 stops Copilot before it takes the thread back. The first list never answers.
+      // then, so T3 stops Copilot before it takes the thread back. The first wait for background
+      // work and the first list never answer.
+      fake.hangDrain();
       fake.hangList();
       fake.failTaskLists(2);
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, autopilot, 2));
@@ -1090,6 +1156,8 @@ describe("CopilotSdkAdapterV2", () => {
         data: { toolCallId: "bg-unknown", toolName: "bash", arguments: { command: "pnpm dev" } },
       });
       yield* fake.finishRun();
+      yield* fake.takeCall("tasks.waitForPending");
+      yield* TestClock.adjust("11 minutes");
       yield* fake.takeCall("tasks.list");
       yield* TestClock.adjust("15 seconds");
       yield* Effect.all(Array.from({ length: 2 }, () => fake.takeCall("tasks.list")));
@@ -1103,6 +1171,40 @@ describe("CopilotSdkAdapterV2", () => {
         .startTurn(yield* turnInput(harness.providerThread, autopilot, 3))
         .pipe(Effect.result);
       assert.strictEqual(next._tag, "Failure");
+
+      // A normal drain listed no tasks, then work started and the turn failed. That empty list,
+      // answered late, must not settle the failure; only the failure's own list can.
+      yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
+      const releaseDrainList = fake.holdList();
+      fake.hangList();
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, autopilot, 4));
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.finishRun();
+      yield* fake.takeCall("tasks.list");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_start",
+        data: { toolCallId: "bg-watch", toolName: "bash", arguments: { command: "pnpm watch" } },
+      });
+      yield* fake.emit({
+        ...event,
+        type: "session.background_tasks_changed",
+        ephemeral: true,
+        data: {},
+      });
+      yield* fake.emit({
+        ...event,
+        type: "session.error",
+        data: { errorType: "connection", message: "Connection lost" },
+      });
+      yield* fake.takeCall("tasks.list");
+      yield* releaseDrainList;
+      yield* TestClock.adjust("15 seconds");
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "failed",
+        threadDisposition: "broken",
+      });
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

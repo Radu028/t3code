@@ -95,6 +95,8 @@ const TURN_COMPLETION_TIMEOUT_MS = 2_147_483_647;
 const INTERRUPT_CONFIRMATION_TIMEOUT: Duration.Input = "30 seconds";
 const TEXT_FLUSH_INTERVAL: Duration.Input = "50 millis";
 const CLIENT_STOP_TIMEOUT: Duration.Input = "15 seconds";
+// The CLI ends waitForPending itself after ten minutes; this bounds an answer that never comes.
+const BACKGROUND_WAIT_TIMEOUT: Duration.Input = "11 minutes";
 
 const CopilotSdkCapabilitiesV2 = {
   runtimePolicy: { enforcement: "client-boundary" },
@@ -392,6 +394,12 @@ type Inbox =
       readonly type: "compacted";
       readonly turn: ActiveTurn;
       readonly exit: Exit.Exit<CompactResult, ProviderAdapter.ProviderAdapterProtocolError>;
+    }
+  | {
+      /** The task list for a turn that ended without completing. */
+      readonly type: "ending";
+      readonly turn: ActiveTurn;
+      readonly busy: boolean | undefined;
     }
   | {
       readonly type: "drained";
@@ -1580,9 +1588,10 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         active = undefined;
         if (status === "failed") {
           const failure = makeProviderFailure({
-            // A turn T3 stopped after it failed keeps that failure's class, such as a usage limit.
+            // A turn that failed before its process went away keeps that failure's class, such as
+            // a usage limit.
             class:
-              disposition === "broken" && turn.ending === undefined
+              disposition === "broken" && turn.lastError === undefined && turn.ending === undefined
                 ? "transport_error"
                 : failureClass(turn.lastError),
             message: detail ?? "Copilot could not finish the turn.",
@@ -1666,7 +1675,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         turn.ending = { status, ...(detail === undefined ? {} : { detail }) };
         turn.tasksChanged = false;
         yield* listsRunningTasks(target).pipe(
-          Effect.flatMap((busy) => Queue.offer(inbox, { type: "drained", turn, busy })),
+          Effect.flatMap((busy) => Queue.offer(inbox, { type: "ending", turn, busy })),
           Effect.forkIn(sessionScope),
         );
       });
@@ -1986,6 +1995,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         if (target === undefined) return yield* finish(turn, "completed");
         // waitForPending also returns on its own timeout, so the task list decides.
         yield* Effect.tryPromise(() => target.rpc.tasks.waitForPending()).pipe(
+          Effect.timeout(BACKGROUND_WAIT_TIMEOUT),
           Effect.catchCause((cause) =>
             Effect.logWarning("Could not wait for Copilot's background work", cause),
           ),
@@ -2009,7 +2019,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         const reason = errorText(isProtocolError(failure) ? failure.cause : failure);
         if (/\bdisconnected\b/i.test(reason ?? "")) {
           markBroken();
-          return yield* finish(turn, "failed", "Copilot stopped unexpectedly.", "broken");
+          return yield* finish(
+            turn,
+            "failed",
+            turn.lastError?.message ?? "Copilot stopped unexpectedly.",
+            "broken",
+          );
         }
         if (/\baborted\b/i.test(reason ?? "")) return yield* release(turn, "cancelled");
         yield* release(turn, "failed", turn.lastError?.message ?? reason);
@@ -2027,24 +2042,27 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             case "settled":
               if (active === entry.turn) yield* settle(entry.turn, entry.exit);
               return;
+            case "ending": {
+              const turn = entry.turn;
+              const ending = turn.ending;
+              if (active !== turn || turn.forcedStop || ending === undefined) return;
+              // A steer's run or a task that started after the list may still be working.
+              const quiet =
+                entry.busy === false &&
+                turn.steers.size === 0 &&
+                !turn.followUpRunning &&
+                !turn.tasksChanged;
+              if (quiet) return yield* finish(turn, ending.status, ending.detail);
+              // Forked: the kill path waits for this event permit.
+              return yield* killTurn(turn, ending.status, ending.detail).pipe(
+                Effect.forkIn(sessionScope),
+                Effect.asVoid,
+              );
+            }
             case "drained": {
               const turn = entry.turn;
-              if (active !== turn || turn.forcedStop) return;
-              const ending = turn.ending;
-              if (ending !== undefined) {
-                // A steer's run or a task that started after the list may still be working.
-                const quiet =
-                  entry.busy === false &&
-                  turn.steers.size === 0 &&
-                  !turn.followUpRunning &&
-                  !turn.tasksChanged;
-                if (quiet) return yield* finish(turn, ending.status, ending.detail);
-                // Forked: the kill path waits for this event permit.
-                return yield* killTurn(turn, ending.status, ending.detail).pipe(
-                  Effect.forkIn(sessionScope),
-                  Effect.asVoid,
-                );
-              }
+              // An ending turn waits for its own task list; this one may predate its last work.
+              if (active !== turn || turn.forcedStop || turn.ending !== undefined) return;
               turn.draining = false;
               // A steer may have started a run while the drain waited; that run ends the turn.
               if (turn.steers.size > 0 || turn.followUpRunning) return;
@@ -2100,7 +2118,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               const turn = active;
               if (turn?.forcedStop) return;
               if (turn) {
-                return yield* finish(turn, "failed", "Copilot stopped unexpectedly.", "broken");
+                return yield* finish(
+                  turn,
+                  "failed",
+                  turn.lastError?.message ?? "Copilot stopped unexpectedly.",
+                  "broken",
+                );
               }
               // An error thread makes T3 resume it, which relaunches Copilot.
               yield* updateThread({ status: "error" });
@@ -2667,11 +2690,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               return yield* protocolError("This Copilot turn cannot be steered");
             }
             const message = yield* prompt(args.message);
-            // The turn may have settled while the prompt was prepared. Holding the event permit
-            // keeps it from settling during delivery, and the recorded id lets settle know
-            // whether Copilot still owes a follow-up run for this steer.
+            // The event permit keeps the turn from settling during delivery, so the recorded id
+            // tells settle whether Copilot owes this steer a run. Not the commands lock: Stop must
+            // still run while a send hangs, and its kill rejects that send.
             yield* Effect.gen(function* () {
-              if (active !== turn || session !== target) {
+              if (active !== turn || session !== target || turn.interruptRequested) {
                 return yield* protocolError("The Copilot turn ended before the steer was sent");
               }
               // Immediate delivery joins the running turn and leaves background agents running.
@@ -2683,7 +2706,6 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           },
           (effect, args) =>
             effect.pipe(
-              commands.withPermits(1),
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterSteerRunError({
