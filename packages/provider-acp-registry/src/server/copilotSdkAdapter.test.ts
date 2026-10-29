@@ -27,6 +27,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Predicate from "effect/Predicate";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Sink from "effect/Sink";
@@ -121,6 +122,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   let failedLists = 0;
   const switchResults: Array<Awaited<ReturnType<CopilotSdkSession["rpc"]["model"]["switchTo"]>>> =
     [];
+  const switchFailures: Array<Error> = [];
   const gate = () => {
     let release!: () => void;
     const promise = new Promise<void>((resolve) => {
@@ -159,6 +161,8 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       model: {
         switchTo: async (params) => {
           record("model.switchTo", params);
+          const failure = switchFailures.shift();
+          if (failure) throw failure;
           return switchResults.shift() ?? { modelId: params.modelId };
         },
       },
@@ -312,6 +316,9 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         command: "pnpm test",
         attachmentMode: "attached" as const,
       }));
+    },
+    failNextSwitch: (failure: Error) => {
+      switchFailures.push(failure);
     },
     queueSwitchResult: (result: (typeof switchResults)[number]) => {
       switchResults.push(result);
@@ -1279,6 +1286,53 @@ describe("CopilotSdkAdapterV2", () => {
         status: "failed",
         threadDisposition: "broken",
       });
+
+      // Copilot answers a finished background task with a root run of its own. waitForPending
+      // can return while that run works and no task is listed; the turn ends once it idles.
+      yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
+      fake.setRunningTasks(0);
+      const releaseFollowUpWait = fake.holdDrain();
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, autopilot, 6));
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_start",
+        data: { toolCallId: "bg-tests", toolName: "bash", arguments: { command: "pnpm test" } },
+      });
+      yield* fake.finishRun();
+      yield* fake.takeCall("tasks.waitForPending");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_complete",
+        data: {
+          toolCallId: "bg-tests",
+          success: true,
+          result: { content: "ok" },
+          shellExecution: { exitCode: 0 },
+        },
+      });
+      yield* fake.emit({ ...event, type: "assistant.turn_start", data: { turnId: "7" } });
+      yield* releaseFollowUpWait;
+      yield* fake.takeCall("tasks.list");
+      yield* Effect.promise(() => Promise.resolve());
+      yield* fake.emit({
+        ...event,
+        type: "assistant.message",
+        data: { messageId: "m-follow-up", content: "Tests pass" },
+      });
+      yield* fake.emit({
+        ...event,
+        type: "session.idle",
+        ephemeral: true,
+        data: { mode: "autopilot" },
+      });
+      const followed = yield* harness.untilTerminal();
+      assert.isTrue(
+        turnItems(followed).some(
+          (item) => item.type === "assistant_message" && item.text === "Tests pass",
+        ),
+      );
+      assert.deepInclude(followed.at(-1), { type: "turn.terminal", status: "completed" });
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -1567,6 +1621,16 @@ describe("CopilotSdkAdapterV2", () => {
       yield* fake.takeCall("sendAndWait");
       yield* fake.finishRun();
       yield* harness.untilTerminal();
+      // Copilot rejects an effort the model does not support. No prompt was sent, so T3 must be
+      // able to tell, and keep the native session for the retry.
+      fake.failNextSwitch(new Error("Reasoning effort max is not supported by gpt-5.5"));
+      const rejected = yield* harness.runtime
+        .startTurn(
+          yield* turnInput(harness.providerThread, [{ id: "reasoning_effort", value: "max" }], 3),
+        )
+        .pipe(Effect.flip);
+      assert.isTrue(Predicate.isTagged(rejected.cause, "CopilotPromptNotSentError"));
+      yield* fake.takeCall("model.switchTo");
       // Copilot asks for compaction instead of switching: the turn must not run on the old model.
       fake.queueSwitchResult({
         confirmation: {

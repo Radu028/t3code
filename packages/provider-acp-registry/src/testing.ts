@@ -11,6 +11,7 @@ export {
   normalizeDevinToolCall,
 } from "./server/devinAcp.ts";
 export { extractCopilotSubagentUpdate, makeCopilotSubagentRouting } from "./server/copilotAcp.ts";
+export { CopilotPromptNotSentError } from "./server/copilotSdkAdapter.ts";
 export {
   acpRegistryProbeFailure,
   acpRegistryProbeResult,

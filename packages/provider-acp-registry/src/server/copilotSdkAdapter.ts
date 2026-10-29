@@ -484,6 +484,15 @@ const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
  * Raised when Copilot refuses a model switch because the conversation does not fit the target
  * model's context. `makeProviderFailure` shows its message to the user.
  */
+/**
+ * Any failure before Copilot was handed the turn's prompt, such as a settings change it rejected.
+ * T3 then keeps the native session for the retry; the cause keeps the message the user sees.
+ */
+export class CopilotPromptNotSentError extends Schema.TaggedError<CopilotPromptNotSentError>()(
+  "CopilotPromptNotSentError",
+  { cause: Schema.Defect() },
+) {}
+
 class CopilotModelSwitchError extends Schema.TaggedError<CopilotModelSwitchError>()(
   "CopilotModelSwitchError",
   {
@@ -2047,12 +2056,20 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               turn.followUpRunning = true;
             }
             return;
+          case "assistant.turn_start":
+            // After the request settled, a root run is Copilot's own follow-up, such as one
+            // answering a finished background task.
+            if (root && turn.requestSettled && event.data.parentToolCallId === undefined) {
+              turn.followUpRunning = true;
+            }
+            return;
           case "session.idle":
-            // Autopilot idles between continuations; autopilot_stopped ends its runs.
-            if (!root || event.data.mode === "autopilot") return;
+            // Autopilot idles between continuations of the request; after it settled, an idle
+            // ends a follow-up run.
+            if (!root || (event.data.mode === "autopilot" && !turn.requestSettled)) return;
             turn.followUpRunning = false;
             if (turn.requestSettled && event.data.aborted === true) {
-              return yield* finish(turn, turn.interruptRequested ? "interrupted" : "cancelled");
+              return yield* release(turn, turn.interruptRequested ? "interrupted" : "cancelled");
             }
             return yield* complete(turn);
           case "session.autopilot_stopped":
@@ -2768,6 +2785,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           ),
         startTurn: (args) =>
           start(args).pipe(
+            // start() hands the prompt over last, so every failure it raises came before.
+            Effect.mapError((cause) => new CopilotPromptNotSentError({ cause })),
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>

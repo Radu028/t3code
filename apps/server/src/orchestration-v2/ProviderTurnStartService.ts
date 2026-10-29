@@ -96,7 +96,7 @@ const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 /**
  * Providers refuse these before they read the prompt. Claude: replacing a process running
  * background work, an appended system prompt or settings it cannot read, or MCP registration
- * that never answers while the query opens. Copilot: a model switch the context does not fit.
+ * that never answers while the query opens. Copilot: any failure before its prompt is sent.
  */
 const PROMPT_REFUSAL_TAGS = [
   "ClaudeBackgroundWorkBlocksQueryReplacementError",
@@ -104,7 +104,7 @@ const PROMPT_REFUSAL_TAGS = [
   "ClaudeAppendSystemPromptMissingValueError",
   "ClaudeSettingsLaunchArgError",
   "ClaudeMcpRegistrationTimeoutError",
-  "CopilotModelSwitchError",
+  "CopilotPromptNotSentError",
 ] as const;
 
 const refusedBeforePrompt = (error: unknown): boolean =>

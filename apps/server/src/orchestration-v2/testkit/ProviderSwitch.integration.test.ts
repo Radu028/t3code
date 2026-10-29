@@ -46,6 +46,7 @@ import {
   canReuseCodexContextUsage,
 } from "../Adapters/CodexAdapterV2.ts";
 import { AcpProviderCapabilitiesV2 } from "@t3tools/provider-acp/server/adapter";
+import { CopilotPromptNotSentError } from "@t3tools/provider-acp-registry/testing";
 import * as EventSink from "../EventSink.ts";
 import * as EventStore from "../EventStore.ts";
 import * as LegacyV1ThreadImporter from "../legacy/LegacyV1ThreadImporter.ts";
@@ -418,12 +419,6 @@ const waitForIdle = Effect.fn("ProviderSwitchTest.waitForIdle")(function* (
 // Same tag as the adapter's unexported error raised when Claude never answers setMcpServers.
 class ClaudeMcpRegistrationTimeoutError extends Schema.TaggedError<ClaudeMcpRegistrationTimeoutError>()(
   "ClaudeMcpRegistrationTimeoutError",
-  {},
-) {}
-
-// Same tag as the Copilot SDK adapter's error for a model switch the conversation does not fit.
-class CopilotModelSwitchError extends Schema.TaggedError<CopilotModelSwitchError>()(
-  "CopilotModelSwitchError",
   {},
 ) {}
 
@@ -1486,7 +1481,12 @@ describe("orchestration v2 provider switching", () => {
         cause: new ClaudeMcpRegistrationTimeoutError(),
       }),
     ],
-    ["a model switch the conversation does not fit", new CopilotModelSwitchError()],
+    [
+      "a Copilot setting rejected before the prompt",
+      new CopilotPromptNotSentError({
+        cause: new Error("Reasoning effort max is not supported by gpt-5.5"),
+      }),
+    ],
   ] as const)("keeps the native session after turns refused for %s", ([, refusalCause]) =>
     Effect.scoped(
       Effect.gen(function* () {
