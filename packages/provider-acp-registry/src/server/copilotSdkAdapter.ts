@@ -92,6 +92,7 @@ const DRIVER = ProviderDriverKind.make("acpRegistry");
 const TURN_COMPLETION_TIMEOUT_MS = 2_147_483_647;
 const INTERRUPT_CONFIRMATION_TIMEOUT: Duration.Input = "30 seconds";
 const TEXT_FLUSH_INTERVAL: Duration.Input = "50 millis";
+const CLIENT_STOP_TIMEOUT: Duration.Input = "15 seconds";
 
 const CopilotSdkCapabilitiesV2 = {
   runtimePolicy: { enforcement: "client-boundary" },
@@ -323,6 +324,10 @@ interface ActiveTurn {
   readonly done: Deferred.Deferred<void>;
   planId: PlanId | undefined;
   compaction: string | undefined;
+  /** Steering messages Copilot has not yet taken into the conversation. */
+  readonly steers: Set<string>;
+  /** The request settled with a steer outstanding; Copilot runs it as a follow-up. */
+  awaitingFollowUp: boolean;
   interruptRequested: boolean;
   lastError: CopilotError | undefined;
 }
@@ -546,28 +551,31 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         { ...options.environment, ...spawn.env },
         yield* mcpSessions.read(input.threadId),
       );
-      const client: CopilotSdkClient = yield* Effect.acquireRelease(
-        Effect.tryPromise({
-          try: () =>
-            makeClient({
-              cliPath,
-              cwd,
-              env: Object.fromEntries(
-                Object.entries(environment).filter(
-                  (entry): entry is [string, string] => entry[1] !== undefined,
-                ),
+      const launchClient = Effect.tryPromise({
+        try: () =>
+          makeClient({
+            cliPath,
+            cwd,
+            env: Object.fromEntries(
+              Object.entries(environment).filter(
+                (entry): entry is [string, string] => entry[1] !== undefined,
               ),
-            }),
-          catch: openError,
-        }),
-        (created) =>
-          Effect.tryPromise(() => created.stop()).pipe(
-            Effect.timeoutOption("15 seconds"),
-            Effect.flatMap((stopped) =>
-              Option.isNone(stopped) ? Effect.tryPromise(() => created.forceStop()) : Effect.void,
             ),
-            Effect.ignore,
-          ),
+          }),
+        catch: (cause) => protocolError("Could not start Copilot", cause),
+      });
+      const forceStop = (target: CopilotSdkClient) =>
+        Effect.tryPromise(() => target.forceStop()).pipe(
+          Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
+          Effect.ignore,
+        );
+      let client = yield* launchClient.pipe(Effect.mapError(openError));
+      yield* Effect.addFinalizer(() =>
+        Effect.tryPromise(() => client.stop()).pipe(
+          Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
+          Effect.flatMap((stopped) => (Option.isNone(stopped) ? forceStop(client) : Effect.void)),
+          Effect.ignore,
+        ),
       );
 
       const now = yield* DateTime.now;
@@ -598,6 +606,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       let applied: Partial<CopilotSessionSettings> = {};
       let currentSettings = copilotSessionSettings(input.modelSelection, input.runtimePolicy);
       let closed = false;
+      // The CLI exited or was killed; the next thread registration launches a new one.
+      let broken = false;
+      const markBroken = () => {
+        broken = true;
+        session = undefined;
+      };
       let questionCount = 0;
       const pending = new Map<RuntimeRequestId, PendingRequest>();
       const pendingPermissions = new Map<string, RuntimeRequestId>();
@@ -798,7 +812,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         output: unknown,
       ): OrchestrationV2TurnItem & { readonly nodeId: NodeId } => {
         const completion = tool.completion;
-        const resultText = completion?.result?.content ?? completion?.error?.message;
+        // detailedContent is the full UI result; content is the model's, possibly truncated.
+        const resultText =
+          completion?.result?.detailedContent ??
+          completion?.result?.content ??
+          completion?.error?.message;
         const path = stringField(tool.arguments, "path", "file_path", "filePath");
         const title = tool.title?.trim() || null;
         if (tool.mcpServerName !== undefined) {
@@ -912,7 +930,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                 content: completion.result?.contents ?? [
                   {
                     type: "text",
-                    text: completion.result?.content ?? completion.error?.message ?? "",
+                    text:
+                      completion.result?.detailedContent ??
+                      completion.result?.content ??
+                      completion.error?.message ??
+                      "",
                   },
                 ],
                 ...(completion.result?.structuredContent === undefined
@@ -1418,12 +1440,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             message: detail ?? "Copilot could not finish the turn.",
             ...(turn.lastError?.errorCode === undefined ? {} : { code: turn.lastError.errorCode }),
           });
+          // T3 builds the error row from the terminal; this only reserves its position.
           const base = baseItem(turn.scope, "failure", completedAt, "failed");
-          yield* emit({
-            type: "turn_item.updated",
-            driver: DRIVER,
-            turnItem: { ...base, type: "error", failure },
-          });
           yield* emit({
             type: "turn.terminal",
             driver: DRIVER,
@@ -1532,7 +1550,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               return yield* settleSubagent(turn, subagent, "failed", event.data.error?.message);
             }
             if (!subagent.background) {
-              return yield* settleSubagent(turn, subagent, "completed", event.data.result?.content);
+              return yield* settleSubagent(
+                turn,
+                subagent,
+                "completed",
+                event.data.result?.detailedContent ?? event.data.result?.content,
+              );
             }
             return;
           }
@@ -1666,6 +1689,32 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           case "session.error":
             if (root) turn.lastError = event.data;
             return;
+          case "user.message":
+            if (root && event.data.messageId !== undefined)
+              turn.steers.delete(event.data.messageId);
+            return;
+          case "session.idle":
+            if (!root || !turn.awaitingFollowUp || event.data.mode === "autopilot") return;
+            return yield* finish(
+              turn,
+              event.data.aborted !== true
+                ? "completed"
+                : turn.interruptRequested
+                  ? "interrupted"
+                  : "cancelled",
+            );
+          case "session.autopilot_stopped":
+            if (!root || !turn.awaitingFollowUp) return;
+            return yield* finish(
+              turn,
+              event.data.reason === "error"
+                ? "failed"
+                : event.data.reason !== "aborted"
+                  ? "completed"
+                  : turn.interruptRequested
+                    ? "interrupted"
+                    : "cancelled",
+            );
         }
         const agentId = event.agentId;
         if (agentId === undefined) return yield* projectContent(turn, turn.scope, event);
@@ -1682,11 +1731,17 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         turn: ActiveTurn,
         exit: Exit.Exit<unknown, ProviderAdapter.ProviderAdapterProtocolError>,
       ) {
-        if (Exit.isSuccess(exit)) return yield* finish(turn, "completed");
+        if (Exit.isSuccess(exit)) {
+          if (turn.steers.size === 0) return yield* finish(turn, "completed");
+          // The next root idle ends the follow-up run, and with it this turn.
+          turn.awaitingFollowUp = true;
+          return;
+        }
         if (turn.interruptRequested) return yield* finish(turn, "interrupted");
         const failure = Cause.squash(exit.cause);
         const reason = errorText(isProtocolError(failure) ? failure.cause : failure);
         if (/\bdisconnected\b/i.test(reason ?? "")) {
+          markBroken();
           return yield* finish(turn, "failed", "Copilot stopped unexpectedly.", "broken");
         }
         if (/\baborted\b/i.test(reason ?? "")) return yield* finish(turn, "cancelled");
@@ -1794,16 +1849,30 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         ) {
           return yield* protocolError("This thread belongs to another provider instance");
         }
+        // A replaced session keeps the app thread's row and, unless forced new, its conversation.
+        const previous = thread?.appThreadId === args.threadId ? thread : undefined;
+        if (args.forceNewNativeThread && session) {
+          const replaced = session;
+          session = undefined;
+          sessionEpoch++;
+          yield* Effect.tryPromise(() => replaced.disconnect()).pipe(Effect.ignore);
+        }
+        if (broken) {
+          yield* forceStop(client);
+          client = yield* launchClient;
+          broken = false;
+        }
         const requestedId = args.forceNewNativeThread
           ? undefined
-          : (existing?.nativeThreadRef?.nativeId ?? input.initialNativeThreadId);
+          : (existing?.nativeThreadRef?.nativeId ??
+            previous?.nativeThreadRef?.nativeId ??
+            input.initialNativeThreadId);
         if (
-          thread &&
+          previous &&
           session &&
-          (requestedId === undefined || requestedId === session.sessionId) &&
-          thread.appThreadId === args.threadId
+          (requestedId === undefined || requestedId === session.sessionId)
         ) {
-          return thread;
+          return previous;
         }
         if (session) {
           return yield* protocolError("Open a new Copilot session to attach another thread");
@@ -1855,11 +1924,16 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         });
         session = opened;
         currentSettings = settings;
-        applied = { model: settings.model, reasoningEffort: settings.reasoningEffort };
+        // A resumed session may hold an older effort override; its first turn sets both again.
+        applied =
+          requestedId === undefined
+            ? { model: settings.model, reasoningEffort: settings.reasoningEffort }
+            : {};
         const createdAt = yield* DateTime.now;
-        thread = existing
+        const base = existing ?? previous;
+        thread = base
           ? {
-              ...existing,
+              ...base,
               providerSessionId: input.providerSessionId,
               nativeThreadRef: nativeRef(opened.sessionId),
               status: "idle",
@@ -1911,13 +1985,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           applied.model !== settings.model ||
           applied.reasoningEffort !== settings.reasoningEffort
         ) {
+          // null clears an effort override; an omitted effort would keep the previous one.
           yield* call("model switch", () =>
-            target.setModel(
-              settings.model,
-              settings.reasoningEffort === undefined
-                ? undefined
-                : { reasoningEffort: settings.reasoningEffort },
-            ),
+            target.rpc.model.switchTo({
+              modelId: settings.model,
+              reasoningEffort: settings.reasoningEffort ?? null,
+            }),
           );
         }
         if (applied.mode !== settings.mode) {
@@ -2014,6 +2087,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           done: yield* Deferred.make<void>(),
           planId: undefined,
           compaction: undefined,
+          steers: new Set(),
+          awaitingFollowUp: false,
           interruptRequested: false,
           lastError: undefined,
         };
@@ -2145,8 +2220,19 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               return yield* protocolError("This Copilot turn cannot be steered");
             }
             const message = yield* prompt(args.message);
-            // Immediate delivery joins the running turn and leaves background agents running.
-            yield* call("steering", () => target.send({ ...message, mode: "immediate" }));
+            // The turn may have settled while the prompt was prepared. Holding the event permit
+            // keeps it from settling during delivery, and the recorded id lets settle know
+            // whether Copilot still owes a follow-up run for this steer.
+            yield* Effect.gen(function* () {
+              if (active !== turn || session !== target) {
+                return yield* protocolError("The Copilot turn ended before the steer was sent");
+              }
+              // Immediate delivery joins the running turn and leaves background agents running.
+              const messageId = yield* call("steering", () =>
+                target.send({ ...message, mode: "immediate" }),
+              );
+              turn.steers.add(messageId);
+            }).pipe(eventPermit.withPermits(1));
           },
           (effect, args) =>
             effect.pipe(
@@ -2175,16 +2261,20 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               return yield* protocolError("This Copilot turn is no longer active");
             }
             turn.interruptRequested = true;
-            yield* call("abort", () => target.abort());
-            // abort() only acknowledges the request; the turn ends when its send settles.
-            const confirmed = yield* Deferred.await(turn.done).pipe(
+            // abort() only acknowledges; the turn ends when its request settles. One deadline
+            // bounds both, since either can hang.
+            const confirmed = yield* Effect.tryPromise(() => target.abort()).pipe(
+              Effect.ignore,
+              Effect.andThen(Deferred.await(turn.done)),
               Effect.timeoutOption(INTERRUPT_CONFIRMATION_TIMEOUT),
             );
-            if (Option.isNone(confirmed)) {
-              yield* finish(turn, "interrupted", undefined, "broken").pipe(
-                eventPermit.withPermits(1),
-              );
-            }
+            if (Option.isSome(confirmed)) return;
+            // T3 checkpoints files after an interrupted turn, so the CLI must stop writing first.
+            yield* forceStop(client);
+            markBroken();
+            yield* finish(turn, "interrupted", undefined, "broken").pipe(
+              eventPermit.withPermits(1),
+            );
           },
           (effect, args) =>
             effect.pipe(

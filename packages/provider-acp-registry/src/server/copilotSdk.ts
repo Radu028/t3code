@@ -13,9 +13,10 @@ export interface CopilotSdkSession {
   readonly send: (options: MessageOptions) => Promise<string>;
   readonly sendAndWait: (options: MessageOptions, timeout?: number) => Promise<unknown>;
   readonly abort: () => Promise<void>;
-  readonly setModel: CopilotSession["setModel"];
   readonly disconnect: () => Promise<void>;
   readonly rpc: {
+    // switchTo, not setModel: only switchTo can clear an effort override (null).
+    readonly model: Pick<CopilotSession["rpc"]["model"], "switchTo">;
     readonly mode: Pick<CopilotSession["rpc"]["mode"], "set">;
     readonly permissions: Pick<
       CopilotSession["rpc"]["permissions"],

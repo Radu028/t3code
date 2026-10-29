@@ -22,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -76,10 +77,14 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   const launches: Array<CopilotSdkClientOptions> = [];
   const resumes: Array<{ readonly sessionId: string; readonly config: ResumeSessionConfig }> = [];
   const resumeFailures: Array<Error> = [];
-  const session: CopilotSdkSession = {
-    sessionId: "copilot-native-1",
+  let created = 0;
+  let hangAbort = false;
+  let sendGate: Promise<void> | undefined;
+  const makeSession = (sessionId: string): CopilotSdkSession => ({
+    sessionId,
     send: async (options) => {
       record("send", options);
+      await sendGate;
       return "steer-message";
     },
     sendAndWait: (options, timeout) => {
@@ -90,13 +95,19 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
     },
     abort: async () => {
       record("abort");
+      if (hangAbort) return new Promise<void>(() => {});
       finishRun?.(new Error("The requested run was aborted before completion."));
     },
-    setModel: async (model, options) => {
-      record("setModel", model, options);
+    disconnect: async () => {
+      record("disconnect", sessionId);
     },
-    disconnect: async () => {},
     rpc: {
+      model: {
+        switchTo: async (params) => {
+          record("model.switchTo", params);
+          return { modelId: params.modelId };
+        },
+      },
       mode: {
         set: async (params) => {
           record("mode.set", params);
@@ -114,12 +125,12 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         },
       },
     },
-  };
+  });
   const client: CopilotSdkClient = {
-    createSession: async (created) => {
-      record("createSession", created);
-      config = created;
-      return session;
+    createSession: async (opened) => {
+      record("createSession", opened);
+      config = opened;
+      return makeSession(`copilot-native-${++created}`);
     },
     resumeSession: async (sessionId, resumed) => {
       record("resumeSession", sessionId);
@@ -127,10 +138,13 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       const failure = resumeFailures.shift();
       if (failure) throw failure;
       config = resumed;
-      return session;
+      return makeSession(sessionId);
     },
     stop: async () => [],
-    forceStop: async () => {},
+    forceStop: async () => {
+      record("forceStop");
+      finishRun?.(new Error("Session disconnected while waiting for a response"));
+    },
   };
   return {
     launches,
@@ -141,6 +155,16 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       return client;
     },
     config: () => config,
+    hangAbort: () => {
+      hangAbort = true;
+    },
+    holdSend: () => {
+      let release!: () => void;
+      sendGate = new Promise((resolve) => {
+        release = resolve;
+      });
+      return Effect.sync(() => release());
+    },
     emit: (sdkEvent: SessionEvent) => Effect.sync(() => config?.onEvent?.(sdkEvent)),
     finishRun: (error?: Error) => Effect.sync(() => finishRun?.(error)),
     takeCall: Effect.fnUntraced(function* (method: string) {
@@ -326,7 +350,11 @@ describe("CopilotSdkAdapterV2", () => {
           data: {
             toolCallId: "t1",
             success: true,
-            result: { content: "error TS2322" },
+            // The model sees a truncated result; the row keeps the full output.
+            result: {
+              content: "error TS2322 [truncated]",
+              detailedContent: "error TS2322\nerror TS2345",
+            },
             shellExecution: { exitCode: 2 },
           },
         },
@@ -380,7 +408,7 @@ describe("CopilotSdkAdapterV2", () => {
       assert.deepInclude(shell, {
         status: "completed",
         input: "pnpm build",
-        output: "error TS2322",
+        output: "error TS2322\nerror TS2345",
         exitCode: 2,
       });
       const edit = items.filter((item) => item.type === "file_change").at(-1);
@@ -408,7 +436,10 @@ describe("CopilotSdkAdapterV2", () => {
         data: { errorType: "rate_limit", message: "Rate limit exceeded", statusCode: 429 },
       });
       yield* fake.finishRun(new Error("Rate limit exceeded"));
-      const terminal = (yield* harness.untilTerminal()).at(-1);
+      const events = yield* harness.untilTerminal();
+      // T3 builds the error row from the terminal; a second one would duplicate it.
+      assert.isFalse(turnItems(events).some((item) => item.type === "error"));
+      const terminal = events.at(-1);
       assert.strictEqual(terminal?.type, "turn.terminal");
       if (terminal?.type !== "turn.terminal" || terminal.status !== "failed") {
         return assert.fail("expected a failed turn");
@@ -445,6 +476,120 @@ describe("CopilotSdkAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.effect("keeps the turn open for a steer Copilot runs after the request settles", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      const input = yield* turnInput(harness.providerThread);
+      yield* harness.runtime.startTurn(input);
+      const turnId = (yield* harness.takeRunningTurn()).id;
+      yield* fake.takeCall("sendAndWait");
+      const releaseSend = fake.holdSend();
+      const steering = yield* harness.runtime
+        .steerTurn({
+          threadId: THREAD_ID,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: turnId,
+          message: { ...input.message, messageId: MessageId.make("steer"), text: "Also run lint" },
+        })
+        .pipe(Effect.forkScoped);
+      yield* fake.takeCall("send");
+      // The request ends while the steer is in flight, so Copilot runs it as a follow-up.
+      yield* fake.emit({ ...event, type: "session.idle", ephemeral: true, data: {} });
+      yield* fake.finishRun();
+      yield* releaseSend;
+      yield* Fiber.join(steering);
+      for (const sdkEvent of [
+        {
+          ...event,
+          type: "user.message",
+          data: { messageId: "steer-message", content: "Also run lint" },
+        },
+        {
+          ...event,
+          type: "assistant.message",
+          data: { messageId: "m-lint", content: "Lint passes" },
+        },
+        { ...event, type: "session.idle", ephemeral: true, data: { aborted: false } },
+      ] satisfies ReadonlyArray<SessionEvent>) {
+        yield* fake.emit(sdkEvent);
+      }
+      const events = yield* harness.untilTerminal();
+      assert.isTrue(
+        turnItems(events).some(
+          (item) => item.type === "assistant_message" && item.text === "Lint passes",
+        ),
+      );
+      assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("relaunches Copilot and resumes its session after the CLI exits", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.finishRun(new Error("Session disconnected while waiting for a response"));
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "failed",
+        threadDisposition: "broken",
+      });
+      const resumed = yield* harness.runtime.resumeThread({
+        providerThread: harness.providerThread,
+      });
+      assert.strictEqual(fake.launches.length, 2);
+      assert.deepStrictEqual(
+        fake.resumes.map((resume) => resume.sessionId),
+        ["copilot-native-1"],
+      );
+      yield* harness.runtime.startTurn(yield* turnInput(resumed, [], 2));
+      yield* fake.takeCall("sendAndWait");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("stops the Copilot process when an interrupt is never confirmed", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      fake.hangAbort();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      const turnId = (yield* harness.takeRunningTurn()).id;
+      yield* fake.takeCall("sendAndWait");
+      const interrupting = yield* harness.runtime
+        .interruptTurn({ providerThread: harness.providerThread, providerTurnId: turnId })
+        .pipe(Effect.forkScoped);
+      yield* fake.takeCall("abort");
+      yield* TestClock.adjust("30 seconds");
+      yield* fake.takeCall("forceStop");
+      yield* Fiber.join(interrupting);
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "interrupted",
+        threadDisposition: "broken",
+      });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("replaces the native session when T3 forces a new one", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      const replaced = yield* harness.runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: selection(),
+        runtimePolicy: policy,
+        existingProviderThread: { ...harness.providerThread, nativeThreadRef: null },
+        forceNewNativeThread: true,
+      });
+      assert.strictEqual(replaced.id, harness.providerThread.id);
+      assert.strictEqual(replaced.nativeThreadRef?.nativeId, "copilot-native-2");
+      assert.deepStrictEqual((yield* fake.takeCall("disconnect")).args, ["copilot-native-1"]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("applies mode, allow-all, model and effort before the turn's message", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeCopilot();
@@ -456,15 +601,21 @@ describe("CopilotSdkAdapterV2", () => {
           { id: "reasoning_effort", value: "high" },
         ]),
       );
-      assert.deepStrictEqual((yield* fake.takeCall("setModel")).args, [
-        "claude-sonnet-4.5",
-        { reasoningEffort: "high" },
+      assert.deepStrictEqual((yield* fake.takeCall("model.switchTo")).args, [
+        { modelId: "claude-sonnet-4.5", reasoningEffort: "high" },
       ]);
       assert.deepStrictEqual((yield* fake.takeCall("mode.set")).args, [{ mode: "autopilot" }]);
       assert.deepStrictEqual((yield* fake.takeCall("permissions.setMode")).args, [
         { mode: "allow-all" },
       ]);
       yield* fake.takeCall("sendAndWait");
+      yield* fake.finishRun();
+      yield* harness.untilTerminal();
+      // Dropping the effort option must clear Copilot's override, not keep "high".
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, [], 2));
+      assert.deepStrictEqual((yield* fake.takeCall("model.switchTo")).args, [
+        { modelId: "claude-sonnet-4.5", reasoningEffort: null },
+      ]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
