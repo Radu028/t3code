@@ -93,6 +93,8 @@ const DRIVER = ProviderDriverKind.make("acpRegistry");
 /** Node's setTimeout ceiling: a turn ends on Copilot's completion, never on a timer. */
 const TURN_COMPLETION_TIMEOUT_MS = 2_147_483_647;
 const INTERRUPT_CONFIRMATION_TIMEOUT: Duration.Input = "30 seconds";
+// T3 runs a thread's effects one at a time, so a Stop queued behind a steer waits for it.
+const STEER_DELIVERY_TIMEOUT: Duration.Input = "30 seconds";
 const TEXT_FLUSH_INTERVAL: Duration.Input = "50 millis";
 const CLIENT_STOP_TIMEOUT: Duration.Input = "15 seconds";
 // The CLI ends waitForPending itself after ten minutes; this bounds an answer that never comes.
@@ -1908,8 +1910,19 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                 : { afterTokenCount: event.data.postCompactionTokens }),
             });
           }
-          case "session.error":
+          case "session.error": {
             if (!root) return;
+            // Copilot refused a steer before running it; the turn goes on without it.
+            const refused = event.data.originatingMessageId;
+            if (refused !== undefined && turn.steers.delete(refused)) {
+              yield* publishItem(turn.scope, "system", {
+                ...baseItem(turn.scope, `error:${event.id}`, yield* DateTime.now, "completed"),
+                type: "system_notice",
+                title: "Copilot did not run a steering message",
+                message: event.data.message,
+              });
+              return yield* complete(turn);
+            }
             turn.lastError = event.data;
             // After the request settled, nothing else reports a follow-up run's failure.
             if (turn.requestSettled) return yield* release(turn, "failed", event.data.message);
@@ -1920,6 +1933,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               turn.followUpRunning = false;
             }
             return;
+          }
           case "session.warning": {
             if (!root) return;
             const time = yield* DateTime.now;
@@ -1981,6 +1995,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       });
       /** Ends a settled turn once Copilot owes nothing for it. */
       const complete = Effect.fnUntraced(function* (turn: ActiveTurn) {
+        // An ending turn has its own task check, and its task-change marker must survive.
+        if (turn.ending !== undefined) return;
         if (!turn.requestSettled || turn.steers.size > 0 || turn.followUpRunning) return;
         if (turn.followUpFailure !== undefined) {
           return yield* release(turn, "failed", turn.followUpFailure.message);
@@ -2693,16 +2709,24 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             // The event permit keeps the turn from settling during delivery, so the recorded id
             // tells settle whether Copilot owes this steer a run. Not the commands lock: Stop must
             // still run while a send hangs, and its kill rejects that send.
-            yield* Effect.gen(function* () {
+            const delivered = yield* Effect.gen(function* () {
               if (active !== turn || session !== target || turn.interruptRequested) {
                 return yield* protocolError("The Copilot turn ended before the steer was sent");
               }
               // Immediate delivery joins the running turn and leaves background agents running.
               const messageId = yield* call("steering", () =>
                 target.send({ ...message, mode: "immediate" }),
-              );
-              turn.steers.add(messageId);
+              ).pipe(Effect.timeoutOption(STEER_DELIVERY_TIMEOUT));
+              if (Option.isSome(messageId)) turn.steers.add(messageId.value);
+              return Option.isSome(messageId);
             }).pipe(eventPermit.withPermits(1));
+            if (delivered) return;
+            // Copilot may have taken the message, and its run could never be matched to this
+            // turn, so only stopping Copilot leaves no work behind.
+            yield* killTurn(turn, "failed", "Copilot did not acknowledge a steering message.").pipe(
+              Effect.forkIn(sessionScope),
+            );
+            return yield* protocolError("Copilot did not acknowledge the steering message in time");
           },
           (effect, args) =>
             effect.pipe(

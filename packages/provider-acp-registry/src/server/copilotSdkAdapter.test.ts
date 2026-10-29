@@ -839,7 +839,8 @@ describe("CopilotSdkAdapterV2", () => {
       const terminal = (yield* harness.untilTerminal()).at(-1);
       assert.deepInclude(terminal, { type: "turn.terminal", status: "interrupted" });
 
-      // A steer Copilot never acknowledges must not keep Stop from aborting, then killing.
+      // T3 runs a Stop only after the steer before it. A steer Copilot never acknowledges fails
+      // after its bound, and since Copilot may have taken it, T3 stops Copilot.
       fake.hangSend();
       const second = yield* turnInput(running, [], 2);
       yield* harness.runtime.startTurn(second);
@@ -855,18 +856,14 @@ describe("CopilotSdkAdapterV2", () => {
         })
         .pipe(Effect.forkScoped);
       yield* fake.takeCall("send");
-      const stopping = yield* harness.runtime
-        .interruptTurn({ providerThread: running, providerTurnId: secondTurn })
-        .pipe(Effect.forkScoped);
-      yield* fake.takeCall("abort");
       yield* TestClock.adjust("30 seconds");
-      yield* Fiber.join(stopping);
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(steering)));
       assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
         type: "turn.terminal",
-        status: "interrupted",
+        status: "failed",
         threadDisposition: "broken",
       });
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(steering)));
+      assert.isTrue(fake.called("forceStop"));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -968,69 +965,93 @@ describe("CopilotSdkAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.effect("fails a steer's follow-up run on its error or on a CLI exit", () =>
-    Effect.gen(function* () {
-      // early-error: the follow-up fails before the request's own wait settles.
-      for (const ending of ["error", "exit", "early-error"] as const) {
-        yield* Effect.gen(function* () {
-          const fake = yield* makeFakeCopilot();
-          const harness = yield* makeHarness(fake);
-          const input = yield* turnInput(harness.providerThread);
-          yield* harness.runtime.startTurn(input);
-          const turnId = (yield* harness.takeRunningTurn()).id;
-          yield* fake.takeCall("sendAndWait");
-          yield* harness.runtime.steerTurn({
-            threadId: THREAD_ID,
-            runId: input.runId,
-            providerThread: harness.providerThread,
-            providerTurnId: turnId,
-            message: { ...input.message, messageId: MessageId.make("steer"), text: "Retry" },
-          });
-          const rateLimited = {
-            ...event,
-            type: "session.error",
-            data: { errorType: "rate_limit", message: "Rate limit exceeded", statusCode: 429 },
-          } satisfies SessionEvent;
-          if (ending === "early-error") {
-            for (const sdkEvent of [
-              { ...event, type: "session.idle", ephemeral: true, data: { aborted: false } },
-              {
+  it.effect(
+    "fails a steer's follow-up run on its error or a CLI exit, and drops a refused steer",
+    () =>
+      Effect.gen(function* () {
+        // early-error: the follow-up fails before the request's own wait settles. refused: Copilot
+        // rejects the steer before it runs, so only the steer fails.
+        for (const ending of ["error", "exit", "early-error", "refused"] as const) {
+          yield* Effect.gen(function* () {
+            const fake = yield* makeFakeCopilot();
+            const harness = yield* makeHarness(fake);
+            const input = yield* turnInput(harness.providerThread);
+            yield* harness.runtime.startTurn(input);
+            const turnId = (yield* harness.takeRunningTurn()).id;
+            yield* fake.takeCall("sendAndWait");
+            yield* harness.runtime.steerTurn({
+              threadId: THREAD_ID,
+              runId: input.runId,
+              providerThread: harness.providerThread,
+              providerTurnId: turnId,
+              message: { ...input.message, messageId: MessageId.make("steer"), text: "Retry" },
+            });
+            const rateLimited = {
+              ...event,
+              type: "session.error",
+              data: { errorType: "rate_limit", message: "Rate limit exceeded", statusCode: 429 },
+            } satisfies SessionEvent;
+            if (ending === "early-error") {
+              for (const sdkEvent of [
+                { ...event, type: "session.idle", ephemeral: true, data: { aborted: false } },
+                {
+                  ...event,
+                  type: "user.message",
+                  data: { messageId: "steer-message", content: "Retry", delivery: "idle" },
+                },
+                rateLimited,
+                { ...event, type: "session.idle", ephemeral: true, data: { aborted: false } },
+              ] satisfies ReadonlyArray<SessionEvent>) {
+                yield* fake.emit(sdkEvent);
+              }
+            }
+            if (ending === "refused") {
+              yield* fake.emit({
+                ...rateLimited,
+                data: {
+                  errorType: "context_limit",
+                  message: "Prompt is too long",
+                  originatingMessageId: "steer-message",
+                },
+              });
+              yield* fake.finishRun();
+              const events = yield* harness.untilTerminal();
+              assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
+              assert.deepInclude(
+                turnItems(events).find((item) => item.type === "system_notice"),
+                { message: "Prompt is too long" },
+              );
+              return;
+            }
+            yield* fake.finishRun();
+            yield* Effect.promise(() => Promise.resolve());
+            if (ending !== "early-error") {
+              yield* fake.emit({
                 ...event,
                 type: "user.message",
                 data: { messageId: "steer-message", content: "Retry", delivery: "idle" },
-              },
-              rateLimited,
-              { ...event, type: "session.idle", ephemeral: true, data: { aborted: false } },
-            ] satisfies ReadonlyArray<SessionEvent>) {
-              yield* fake.emit(sdkEvent);
+              });
             }
-          }
-          yield* fake.finishRun();
-          yield* Effect.promise(() => Promise.resolve());
-          if (ending !== "early-error") {
-            yield* fake.emit({
-              ...event,
-              type: "user.message",
-              data: { messageId: "steer-message", content: "Retry", delivery: "idle" },
-            });
-          }
-          if (ending === "error") {
-            yield* fake.emit(rateLimited);
-          } else if (ending === "exit") {
-            yield* fake.exitProcess();
-          }
-          const terminal = (yield* harness.untilTerminal()).at(-1);
-          if (terminal?.type !== "turn.terminal" || terminal.status !== "failed") {
-            return assert.fail(`expected a failed turn after the follow-up ${ending}`);
-          }
-          assert.strictEqual(
-            terminal.failure.message,
-            ending === "exit" ? "Copilot stopped unexpectedly." : "Rate limit exceeded",
-          );
-          assert.strictEqual(terminal.threadDisposition, ending === "exit" ? "broken" : "reusable");
-        }).pipe(Effect.scoped);
-      }
-    }).pipe(Effect.provide(testLayer)),
+            if (ending === "error") {
+              yield* fake.emit(rateLimited);
+            } else if (ending === "exit") {
+              yield* fake.exitProcess();
+            }
+            const terminal = (yield* harness.untilTerminal()).at(-1);
+            if (terminal?.type !== "turn.terminal" || terminal.status !== "failed") {
+              return assert.fail(`expected a failed turn after the follow-up ${ending}`);
+            }
+            assert.strictEqual(
+              terminal.failure.message,
+              ending === "exit" ? "Copilot stopped unexpectedly." : "Rate limit exceeded",
+            );
+            assert.strictEqual(
+              terminal.threadDisposition,
+              ending === "exit" ? "broken" : "reusable",
+            );
+          }).pipe(Effect.scoped);
+        }
+      }).pipe(Effect.provide(testLayer)),
   );
 
   it.effect("waits for Copilot's background work after an autopilot request", () =>
@@ -1200,6 +1221,42 @@ describe("CopilotSdkAdapterV2", () => {
       yield* fake.takeCall("tasks.list");
       yield* releaseDrainList;
       yield* TestClock.adjust("15 seconds");
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "failed",
+        threadDisposition: "broken",
+      });
+
+      // A normal drain found a running shell and waits for a task change. The turn fails, and
+      // new work starts after Copilot listed no tasks for the failure: that change must keep
+      // the failure from being released, not start another normal drain.
+      yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
+      fake.setRunningTasks(1);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, autopilot, 5));
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.finishRun();
+      yield* fake.takeCall("tasks.list");
+      yield* Effect.promise(() => Promise.resolve());
+      fake.setRunningTasks(0);
+      const releaseEndingList = fake.holdList();
+      yield* fake.emit({
+        ...event,
+        type: "session.error",
+        data: { errorType: "connection", message: "Connection lost" },
+      });
+      yield* fake.takeCall("tasks.list");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_start",
+        data: { toolCallId: "bg-serve", toolName: "bash", arguments: { command: "pnpm serve" } },
+      });
+      yield* fake.emit({
+        ...event,
+        type: "session.background_tasks_changed",
+        ephemeral: true,
+        data: {},
+      });
+      yield* releaseEndingList;
       assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
         type: "turn.terminal",
         status: "failed",
