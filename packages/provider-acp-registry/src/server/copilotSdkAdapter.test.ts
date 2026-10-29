@@ -1356,6 +1356,15 @@ describe("CopilotSdkAdapterV2", () => {
       yield* Fiber.interrupt(opening);
       assert.isTrue(starting.called("forceStop"));
       yield* releaseStart;
+      // A handshake that never finishes fails the open after its deadline and stops the CLI too.
+      const stalled = yield* makeFakeCopilot();
+      const releaseStalled = stalled.holdStart();
+      const stalledOpen = yield* makeHarness(stalled).pipe(Effect.forkScoped);
+      yield* stalled.takeCall("start");
+      yield* TestClock.adjust("2 minutes");
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(stalledOpen)));
+      assert.isTrue(stalled.called("forceStop"));
+      yield* releaseStalled;
 
       const fake = yield* makeFakeCopilot();
       const sessionScope = yield* Scope.make();

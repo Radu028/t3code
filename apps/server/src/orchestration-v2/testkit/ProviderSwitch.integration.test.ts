@@ -421,6 +421,12 @@ class ClaudeMcpRegistrationTimeoutError extends Schema.TaggedError<ClaudeMcpRegi
   {},
 ) {}
 
+// Same tag as the Copilot SDK adapter's error for a model switch the conversation does not fit.
+class CopilotModelSwitchError extends Schema.TaggedError<CopilotModelSwitchError>()(
+  "CopilotModelSwitchError",
+  {},
+) {}
+
 describe("orchestration v2 provider switching", () => {
   it.live.each([
     "compact-native",
@@ -1480,6 +1486,7 @@ describe("orchestration v2 provider switching", () => {
         cause: new ClaudeMcpRegistrationTimeoutError(),
       }),
     ],
+    ["a model switch the conversation does not fit", new CopilotModelSwitchError()],
   ] as const)("keeps the native session after turns refused for %s", ([, refusalCause]) =>
     Effect.scoped(
       Effect.gen(function* () {

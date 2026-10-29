@@ -96,7 +96,8 @@ const INTERRUPT_CONFIRMATION_TIMEOUT: Duration.Input = "30 seconds";
 // T3 runs a thread's effects one at a time, so a Stop queued behind an RPC waits for it. The
 // turn's own request and /compact are Copilot's work, not an answer, and stay unbounded.
 const RPC_TIMEOUT: Duration.Input = "30 seconds";
-// Opening or resuming a session can start MCP servers and load a long transcript.
+// Starting the CLI, or opening or resuming a session, can start MCP servers and load a long
+// transcript.
 const SESSION_OPEN_TIMEOUT: Duration.Input = "2 minutes";
 const TEXT_FLUSH_INTERVAL: Duration.Input = "50 millis";
 const CLIENT_STOP_TIMEOUT: Duration.Input = "15 seconds";
@@ -649,11 +650,18 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             }),
           catch: (cause) => protocolError("Could not start Copilot", cause),
         });
-        // Owned before the handshake, so a Stop or a failure during it still stops the CLI.
+        // Owned before the handshake, so a Stop, a failure or a stall during it still stops the
+        // CLI. The SDK gives the handshake no deadline of its own.
         yield* Effect.tryPromise({
           try: () => created.start(),
           catch: (cause) => protocolError("Could not start Copilot", cause),
-        }).pipe(Effect.onError(() => terminate(created).pipe(Effect.asVoid)));
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: SESSION_OPEN_TIMEOUT,
+            orElse: () => Effect.fail(protocolError("Copilot did not finish starting in time")),
+          }),
+          Effect.onError(() => terminate(created).pipe(Effect.asVoid)),
+        );
         return created;
       });
       // The SDK's kill reaches only copilot.exe on Windows; taskkill /T also stops its shells and agents.
