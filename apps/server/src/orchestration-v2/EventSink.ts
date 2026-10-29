@@ -73,7 +73,7 @@ export interface EventSinkV2Shape {
       OrchestrationV2ProviderThread,
       "driver" | "providerInstanceId" | "appThreadId" | "nativeThreadRef"
     >;
-    readonly guardPendingUserInputCancellations?: boolean;
+    readonly guardStaleRequestCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
@@ -87,13 +87,13 @@ export interface EventSinkV2Shape {
       OrchestrationV2ProviderThread,
       "driver" | "providerInstanceId" | "appThreadId" | "nativeThreadRef"
     >;
-    readonly guardPendingUserInputCancellations?: boolean;
+    readonly guardStaleRequestCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
-    readonly guardPendingUserInputCancellations?: boolean;
+    readonly guardStaleRequestCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly threadId: ThreadId;
     readonly runId: RunId;
@@ -110,7 +110,7 @@ export interface EventSinkV2Shape {
   >;
   /** Commits only if the expected attempt and ordinal still own the provider thread, protecting newer attempts. */
   readonly writeIfProviderThreadOwner: (input: {
-    readonly guardPendingUserInputCancellations?: boolean;
+    readonly guardStaleRequestCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly providerThreadId: ProviderThreadId;
     readonly runId: RunId;
@@ -195,6 +195,18 @@ export interface EventSinkV2Shape {
     readonly commandId: CommandId;
   }) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkV2Error>;
 }
+
+/** The request that a cancelled request node or card belongs to; null for other events. */
+const cancelledRequestPart = (event: OrchestrationV2DomainEvent): RuntimeRequestId | null => {
+  if (event.type === "node.updated") {
+    return event.payload.status === "cancelled" ? event.payload.runtimeRequestId : null;
+  }
+  return event.type === "turn-item.updated" &&
+    event.payload.status === "cancelled" &&
+    (event.payload.type === "approval_request" || event.payload.type === "user_input_request")
+    ? event.payload.requestId
+    : null;
+};
 
 export class EventSinkV2 extends Context.Service<EventSinkV2, EventSinkV2Shape>()(
   "t3/orchestration-v2/EventSink/EventSinkV2",
@@ -283,46 +295,60 @@ const layerBase: Layer.Layer<
           );
       });
 
-    // A user can answer after terminal normalization reads the pending request.
+    // A user can answer after a provider or terminal normalization decided to cancel a request.
     // Recheck inside the write transaction so stale cleanup cannot erase answers.
-    const guardUserInputCancellations =
+    const guardRequestCancellations =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(function* (events: ReadonlyArray<OrchestrationV2DomainEvent>) {
         const staleRequests = new Set<RuntimeRequestId>();
         const staleNodes = new Set<NodeId>();
+        // Providers also send a request's node and card as events of their own. Those may follow
+        // the request's cancellation, but not a request T3 answered or expired.
+        const closedOtherwise = new Set<RuntimeRequestId>();
         for (const event of events) {
-          if (
-            event.type !== "runtime-request.updated" ||
-            event.payload.kind !== "user_input" ||
-            event.payload.status !== "cancelled"
-          )
+          if (event.type === "runtime-request.updated") {
+            if (event.payload.status !== "cancelled") continue;
+            const current = yield* projectionStore.getRuntimeRequest(
+              event.threadId,
+              event.payload.id,
+            );
+            if (
+              current?.status !== "pending" ||
+              current.kind !== event.payload.kind ||
+              current.providerTurnId !== event.payload.providerTurnId ||
+              current.responseCapability.type === "message"
+            ) {
+              staleRequests.add(event.payload.id);
+              staleNodes.add(event.payload.nodeId);
+            }
             continue;
-          const current = yield* projectionStore.getRuntimeRequest(
-            event.threadId,
-            event.payload.id,
-          );
-          if (
-            current?.status !== "pending" ||
-            current.kind !== "user_input" ||
-            current.providerTurnId !== event.payload.providerTurnId ||
-            current.responseCapability.type === "message"
-          ) {
-            staleRequests.add(event.payload.id);
-            staleNodes.add(event.payload.nodeId);
+          }
+          const requestId = cancelledRequestPart(event);
+          if (requestId === null || closedOtherwise.has(requestId)) continue;
+          const current = yield* projectionStore.getRuntimeRequest(event.threadId, requestId);
+          if (current?.status === "resolved" || current?.status === "expired") {
+            closedOtherwise.add(requestId);
           }
         }
         return events.filter((event) => {
           switch (event.type) {
             case "runtime-request.updated":
               return event.payload.status !== "cancelled" || !staleRequests.has(event.payload.id);
-            case "node.updated":
-              return event.payload.status !== "cancelled" || !staleNodes.has(event.payload.id);
-            case "turn-item.updated":
+            case "node.updated": {
+              if (event.payload.status !== "cancelled") return true;
+              const requestId = event.payload.runtimeRequestId;
               return (
-                event.payload.type !== "user_input_request" ||
-                event.payload.status !== "cancelled" ||
-                !staleRequests.has(event.payload.requestId)
+                !staleNodes.has(event.payload.id) &&
+                (requestId === null || !closedOtherwise.has(requestId))
               );
+            }
+            case "turn-item.updated": {
+              const requestId = cancelledRequestPart(event);
+              return (
+                requestId === null ||
+                !(staleRequests.has(requestId) || closedOtherwise.has(requestId))
+              );
+            }
             default:
               return true;
           }
@@ -438,8 +464,8 @@ const layerBase: Layer.Layer<
             ? yield* updateDelegatedCompletionOnly(input.events, () => true)
             : input.events;
           const normalized = yield* normalizeEvents(
-            input.guardPendingUserInputCancellations === true
-              ? yield* guardUserInputCancellations(events)
+            input.guardStaleRequestCancellations === true
+              ? yield* guardRequestCancellations(events)
               : events,
           );
           const committed = yield* eventStore.append({
@@ -497,8 +523,8 @@ const layerBase: Layer.Layer<
             }
 
             const normalized = yield* normalizeEvents(
-              input.guardPendingUserInputCancellations === true
-                ? yield* guardUserInputCancellations(input.events)
+              input.guardStaleRequestCancellations === true
+                ? yield* guardRequestCancellations(input.events)
                 : input.events,
             );
             const storedEvents = yield* eventStore.append({
@@ -562,8 +588,8 @@ const layerBase: Layer.Layer<
           }
 
           const normalized = yield* normalizeEvents(
-            input.guardPendingUserInputCancellations === true
-              ? yield* guardUserInputCancellations(input.events)
+            input.guardStaleRequestCancellations === true
+              ? yield* guardRequestCancellations(input.events)
               : input.events,
           );
           const storedEvents = yield* eventStore.append({

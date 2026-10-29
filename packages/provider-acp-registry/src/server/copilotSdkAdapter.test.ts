@@ -959,16 +959,28 @@ describe("CopilotSdkAdapterV2", () => {
       );
       assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
 
-      // A task list Copilot cannot return gets a few fresh drains, then ends the turn.
+      // A task list Copilot cannot return gets a few fresh drains. A shell may still be running
+      // then, so T3 stops Copilot before it takes the thread back.
       fake.failTaskLists(3);
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, autopilot, 2));
       yield* fake.takeCall("sendAndWait");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_start",
+        data: { toolCallId: "bg-unknown", toolName: "bash", arguments: { command: "pnpm dev" } },
+      });
       yield* fake.finishRun();
       yield* Effect.all(Array.from({ length: 3 }, () => fake.takeCall("tasks.list")));
       const ended = (yield* harness.untilTerminal()).at(-1);
       if (ended?.type !== "turn.terminal") return assert.fail("no terminal");
-      assert.strictEqual(ended.status, "failed");
+      assert.deepInclude(ended, { status: "failed", threadDisposition: "broken" });
       assert.include(ended.failure?.message, "background work");
+      assert.isTrue(fake.called("forceStop"));
+      // The killed session takes no turn; T3 resumes the thread on a new process first.
+      const next = yield* harness.runtime
+        .startTurn(yield* turnInput(harness.providerThread, autopilot, 3))
+        .pipe(Effect.result);
+      assert.strictEqual(next._tag, "Failure");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

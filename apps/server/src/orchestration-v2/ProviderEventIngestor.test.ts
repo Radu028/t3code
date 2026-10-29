@@ -1481,6 +1481,187 @@ layer("ProviderEventIngestorV2", (it) => {
       ),
   );
 
+  it.effect("keeps a saved approval answer when the provider cancels the approval later", () =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const now = yield* DateTime.now;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const providerThreadId = idAllocator.derive.providerThread({
+        driver: CODEX_DRIVER,
+        nativeThreadId: `${threadId}:approvals`,
+      });
+      const providerTurnId = idAllocator.derive.providerTurn({
+        driver: CODEX_DRIVER,
+        nativeTurnId: `${threadId}:approvals`,
+      });
+      const approval = (key: string, ordinal: number) => {
+        const nodeId = NodeId.make(`${threadId}:${key}`);
+        const request: OrchestrationV2RuntimeRequest = {
+          id: RuntimeRequestId.make(`${threadId}:${key}`),
+          nodeId,
+          providerTurnId,
+          nativeRequestRef: null,
+          kind: "command",
+          status: "pending",
+          responseCapability: { type: "live", providerSessionId },
+          createdAt: now,
+          resolvedAt: null,
+        };
+        const node: OrchestrationV2ExecutionNode = {
+          id: nodeId,
+          threadId,
+          runId: null,
+          parentNodeId: null,
+          rootNodeId: nodeId,
+          kind: "approval_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId,
+          providerTurnId,
+          nativeItemRef: null,
+          runtimeRequestId: request.id,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        };
+        const item: OrchestrationV2TurnItem = {
+          id: TurnItemId.make(`${threadId}:${key}`),
+          threadId,
+          runId: null,
+          nodeId,
+          providerThreadId,
+          providerTurnId,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "waiting",
+          title: "Run pnpm install?",
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "approval_request",
+          requestId: request.id,
+          requestKind: "command",
+        };
+        return { request, node, item };
+      };
+      const domainEvents = Effect.fnUntraced(function* (
+        writes: ReadonlyArray<
+          | {
+              readonly type: "runtime-request.updated";
+              readonly payload: OrchestrationV2RuntimeRequest;
+            }
+          | { readonly type: "node.updated"; readonly payload: OrchestrationV2ExecutionNode }
+          | { readonly type: "turn-item.updated"; readonly payload: OrchestrationV2TurnItem }
+        >,
+      ) {
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        for (const write of writes) {
+          events.push({
+            id: yield* idAllocator.allocate.event({ threadId }),
+            threadId,
+            occurredAt: now,
+            ...write,
+          });
+        }
+        return events;
+      });
+      const answered = approval("answered", 1);
+      const open = approval("open", 2);
+      yield* eventSink.write({
+        events: [
+          threadEvent,
+          ...(yield* domainEvents(
+            [answered, open].flatMap(({ request, node, item }) => [
+              { type: "runtime-request.updated" as const, payload: request },
+              { type: "node.updated" as const, payload: node },
+              { type: "turn-item.updated" as const, payload: item },
+            ]),
+          )),
+        ],
+      });
+      // T3 saves the user's answer and delivers it later; the provider's cleanup runs first.
+      yield* eventSink.write({
+        events: yield* domainEvents([
+          {
+            type: "runtime-request.updated",
+            payload: {
+              ...answered.request,
+              status: "resolved",
+              decision: "accept",
+              resolvedAt: now,
+            },
+          },
+          {
+            type: "node.updated",
+            payload: { ...answered.node, status: "completed", completedAt: now },
+          },
+          {
+            type: "turn-item.updated",
+            payload: { ...answered.item, status: "completed", completedAt: now },
+          },
+        ]),
+      });
+      // Adapters send a closed request, node and card as separate provider events.
+      for (const { request, node, item } of [answered, open]) {
+        for (const event of [
+          {
+            type: "runtime_request.updated" as const,
+            driver: CODEX_DRIVER,
+            threadId,
+            runtimeRequest: { ...request, status: "cancelled" as const, resolvedAt: now },
+          },
+          {
+            type: "node.updated" as const,
+            driver: CODEX_DRIVER,
+            node: { ...node, status: "cancelled" as const, completedAt: now },
+          },
+          {
+            type: "turn_item.updated" as const,
+            driver: CODEX_DRIVER,
+            turnItem: { ...item, status: "cancelled" as const, completedAt: now, updatedAt: now },
+          },
+        ]) {
+          yield* ingestor.ingestNormalized({
+            providerSessionId,
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+            event,
+          });
+        }
+      }
+      const projection = yield* projections.getThreadProjection(threadId);
+      const stored = ({ request, node, item }: ReturnType<typeof approval>) => ({
+        request: projection.runtimeRequests.find((entry) => entry.id === request.id)?.status,
+        node: projection.nodes.find((entry) => entry.id === node.id)?.status,
+        card: projection.turnItems.find((entry) => entry.id === item.id)?.status,
+      });
+      assert.deepEqual(stored(answered), {
+        request: "resolved",
+        node: "completed",
+        card: "completed",
+      });
+      assert.equal(
+        projection.runtimeRequests.find((entry) => entry.id === answered.request.id)?.decision,
+        "accept",
+      );
+      // An approval nobody answered still closes.
+      assert.deepEqual(stored(open), {
+        request: "cancelled",
+        node: "cancelled",
+        card: "cancelled",
+      });
+    }),
+  );
+
   it.effect("persists a failed provider terminal as one expected error item", () =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;

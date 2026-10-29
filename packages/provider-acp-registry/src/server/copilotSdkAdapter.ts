@@ -1583,6 +1583,25 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         yield* Deferred.succeed(turn.done, undefined);
       });
 
+      /** Kills the CLI, then ends the turn as broken, so the next turn starts a fresh process. */
+      const killTurn = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        status: "interrupted" | "failed",
+        detail?: string,
+      ) {
+        // forceStop rejects the request before the process is gone; forcedStop keeps that
+        // rejection, and any event until the kill finishes, from ending the turn.
+        turn.forcedStop = true;
+        markBroken();
+        const failure = yield* terminate(client);
+        yield* Effect.gen(function* () {
+          yield* finish(turn, status, detail, "broken");
+          if (failure !== undefined) {
+            yield* updateSession("error", `Copilot's processes may still be running (${failure})`);
+          }
+        }).pipe(eventPermit.withPermits(1));
+      });
+
       // Projection runs per SDK event inside the session's span; a span per event is noise.
       const projectContent = Effect.fnUntraced(function* (
         turn: ActiveTurn,
@@ -1954,11 +1973,13 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               if (turn.tasksChanged) return yield* complete(turn);
               if (entry.busy === undefined) {
                 if (++turn.listFailures < DRAIN_LIST_ATTEMPTS) return yield* complete(turn);
-                return yield* finish(
+                // Its shells or agents may still be editing files, so T3 stops Copilot before it
+                // takes the thread back. Forked: the kill path waits for this event permit.
+                return yield* killTurn(
                   turn,
                   "failed",
                   "Copilot did not report whether its background work finished.",
-                );
+                ).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
               }
               turn.listFailures = 0;
               if (!entry.busy) return yield* finish(turn, "completed");
@@ -2607,20 +2628,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             );
             if (Option.isSome(confirmed)) return;
             // T3 checkpoints files after an interrupted turn, so the CLI must stop writing first.
-            // forceStop rejects the request before the process is gone; forcedStop keeps that
-            // rejection from ending the turn as reusable.
-            turn.forcedStop = true;
-            markBroken();
-            const failure = yield* terminate(client);
-            yield* Effect.gen(function* () {
-              yield* finish(turn, "interrupted", undefined, "broken");
-              if (failure !== undefined) {
-                yield* updateSession(
-                  "error",
-                  `Copilot's processes may still be running (${failure})`,
-                );
-              }
-            }).pipe(eventPermit.withPermits(1));
+            yield* killTurn(turn, "interrupted");
           },
           (effect, args) =>
             effect.pipe(
