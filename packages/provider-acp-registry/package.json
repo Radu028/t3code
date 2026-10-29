@@ -33,6 +33,7 @@
     "test": "vp test run --config ../../vite.config.ts --dir ."
   },
   "dependencies": {
+    "@github/copilot-sdk": "1.0.28",
     "@noble/hashes": "catalog:",
     "@t3tools/contracts": "workspace:*",
     "@t3tools/provider-acp": "workspace:*",

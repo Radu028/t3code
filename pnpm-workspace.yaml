@@ -18,6 +18,8 @@ allowBuilds:
   electron: false
   electron-winstaller: false
   esbuild: true
+  # Only the Copilot SDK's in-process transport loads it; T3 uses stdio.
+  koffi: false
   msgpackr-extract: true
   msw: false
   node-pty: true
@@ -28,6 +30,18 @@ allowBuilds:
   "@tsc-rs/typescript": true
   utf-8-validate: false
   workerd: false
+
+# The Copilot SDK's platform packages bundle a ~160 MB Copilot runtime; T3 launches
+# the user's own Copilot install instead.
+ignoredOptionalDependencies:
+  - "@github/copilot-sdk-darwin-arm64"
+  - "@github/copilot-sdk-darwin-x64"
+  - "@github/copilot-sdk-linux-arm64"
+  - "@github/copilot-sdk-linux-x64"
+  - "@github/copilot-sdk-linuxmusl-arm64"
+  - "@github/copilot-sdk-linuxmusl-x64"
+  - "@github/copilot-sdk-win32-arm64"
+  - "@github/copilot-sdk-win32-x64"
 
 catalog:
   "@alchemy.run/axiom": 2.0.0-beta.84

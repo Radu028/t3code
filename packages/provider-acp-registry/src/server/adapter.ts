@@ -9,6 +9,8 @@ import {
   extractDevinSubagentUpdate,
 } from "./devinAcp.ts";
 import { extractDroidElicitationForm } from "./droidAcp.ts";
+import type { MakeCopilotSdkClient } from "./copilotSdk.ts";
+import { makeCopilotSdkAdapterV2 } from "./copilotSdkAdapter.ts";
 import {
   copilotClientCapabilitiesMeta,
   extractCopilotSubagentUpdate,
@@ -80,6 +82,7 @@ export interface AcpRegistryAdapterV2Options {
   >;
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
   readonly assertComplete?: Effect.Effect<void, EffectAcpErrors.AcpError>;
+  readonly makeCopilotSdkClient?: MakeCopilotSdkClient;
 }
 
 // Mistral Vibe's application rate-limit code, outside ACP.
@@ -191,6 +194,22 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     registryAgentId === "github-copilot-cli" ||
     (options.settings.source === "local" &&
       /^copilot(\.exe|\.cmd)?$/i.test(options.settings.commandPath.split(/[\\/]/).pop() ?? ""));
+  // Opt-in: Copilot sessions run through the official SDK instead of `copilot --acp`.
+  // The probe, model picker and driver kind stay ACP's, so clients see no difference.
+  if (isCopilot && options.environment.T3_COPILOT_SDK === "1") {
+    return yield* makeCopilotSdkAdapterV2({
+      instanceId: options.instanceId,
+      settings: options.settings,
+      environment: options.environment,
+      resolveSpawn: (cwd) =>
+        catalog
+          .resolve(options.settings, cwd, options.environment)
+          .pipe(Effect.map((resolved) => resolved.spawn)),
+      ...(options.makeCopilotSdkClient === undefined
+        ? {}
+        : { makeClient: options.makeCopilotSdkClient }),
+    });
+  }
   const isClaude =
     registryAgentId === "claude-acp" ||
     (options.settings.source === "local" &&
