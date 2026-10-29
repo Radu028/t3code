@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off -- Windows path math must run on any host for the shim lookup, and the SDK's child is a Node ChildProcess.
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off -- Windows path math must run on any host for the shim lookup, and the SDK's child is a Node ChildProcess. The SDK seam is Promise-based, outside an Effect runtime.
 import * as NodeChildProcess from "node:child_process";
 import * as NodePath from "node:path";
 import type {
@@ -23,7 +23,7 @@ export interface CopilotSdkSession {
       CopilotSession["rpc"]["permissions"],
       "setMode" | "handlePendingPermissionRequest"
     >;
-    readonly tasks: Pick<CopilotSession["rpc"]["tasks"], "waitForPending">;
+    readonly tasks: Pick<CopilotSession["rpc"]["tasks"], "waitForPending" | "list">;
   };
 }
 
@@ -36,7 +36,46 @@ export interface CopilotSdkClient {
   readonly stop: () => Promise<ReadonlyArray<Error>>;
   readonly forceStop: () => Promise<void>;
   /** The Copilot process, so T3 can see it exit and stop its whole process tree. */
-  readonly process: { readonly id: number; readonly exited: Promise<void> } | undefined;
+  readonly process: CopilotProcess | undefined;
+}
+
+export interface CopilotProcess {
+  readonly id: number;
+  /** True once the process exited; its pid may then belong to another process. */
+  readonly hasExited: () => boolean;
+  /** Resolves after the exit and after the SDK dispatched every notification it had read. */
+  readonly exited: Promise<void>;
+}
+
+// A grandchild holding an inherited pipe can keep stdio open long after the exit.
+const STDIO_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
+ * Tracks the SDK's CLI child. Its exit alone is too early: notifications can still sit in
+ * stdout or in the connection's queue, so this waits for stdio to close, then for the
+ * connection's drain, the barrier the SDK itself awaits before it marks sessions disconnected.
+ */
+export function copilotProcess(
+  child: NodeChildProcess.ChildProcess,
+  drain: (() => Promise<unknown>) | undefined,
+): CopilotProcess | undefined {
+  if (child.pid === undefined) return undefined;
+  const hasExited = () => child.exitCode !== null || child.signalCode !== null;
+  const stdioClosed = new Promise<void>((resolve) => {
+    if (hasExited()) return resolve();
+    child.once("close", () => resolve());
+    child.once("exit", () => setTimeout(resolve, STDIO_CLOSE_TIMEOUT_MS).unref());
+  });
+  return {
+    id: child.pid,
+    hasExited,
+    exited: stdioClosed
+      .then(() => drain?.())
+      .then(
+        () => undefined,
+        () => undefined,
+      ),
+  };
 }
 
 export interface CopilotSdkClientOptions {
@@ -58,22 +97,27 @@ export const makeCopilotSdkClient: MakeCopilotSdkClient = async (options) => {
     useLoggedInUser: true,
   });
   await client.start();
-  // SDK 1.0.28 has no exit notification or pid accessor; its spawned child is a private field.
+  // SDK 1.0.28 has no exit notification, pid accessor or drain hook; its CLI child and its
+  // connection (with a memoized drain()) are private fields.
   const child: unknown = Reflect.get(client, "cliProcess");
+  const connection: unknown = Reflect.get(client, "connection");
+  const drainConnection: unknown =
+    typeof connection === "object" && connection !== null
+      ? Reflect.get(connection, "drain")
+      : undefined;
   return {
     createSession: (config) => client.createSession(config),
     resumeSession: (sessionId, config) => client.resumeSession(sessionId, config),
     stop: () => client.stop(),
     forceStop: () => client.forceStop(),
     process:
-      child instanceof NodeChildProcess.ChildProcess && child.pid !== undefined
-        ? {
-            id: child.pid,
-            exited:
-              child.exitCode !== null || child.signalCode !== null
-                ? Promise.resolve()
-                : new Promise((resolve) => child.once("exit", () => resolve())),
-          }
+      child instanceof NodeChildProcess.ChildProcess
+        ? copilotProcess(
+            child,
+            typeof drainConnection === "function"
+              ? () => Promise.resolve(Reflect.apply(drainConnection, connection, []))
+              : undefined,
+          )
         : undefined,
   };
 };

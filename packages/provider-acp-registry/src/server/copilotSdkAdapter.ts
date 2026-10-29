@@ -286,7 +286,7 @@ interface ItemScope {
   readonly providerTurnId: ProviderTurnId | null;
   readonly rootNodeId: NodeId;
   readonly sharesRootNode: boolean;
-  /** Copilot's session id; item keys are Copilot's own ids, so ids stay short and stable. */
+  /** `<instance>:<session>`; item keys are Copilot's own ids, so ids stay short and stable. */
   readonly identity: string;
   readonly ordinalBase: number;
   readonly appThread: OrchestrationV2AppThread;
@@ -337,8 +337,14 @@ interface ActiveTurn {
   followUpRunning: boolean;
   /** sendAndWait succeeded; the turn ends once no steer or follow-up run is outstanding. */
   requestSettled: boolean;
+  /** A follow-up run's error that arrived before the request settled. */
+  followUpFailure: CopilotError | undefined;
   /** Autopilot settled; the turn waits for Copilot's background work to drain. */
   draining: boolean;
+  /** A drain returned with work still running; the next background-task change re-checks. */
+  drainWaiting: boolean;
+  /** Background tasks changed while a drain was in flight, so its task list may be stale. */
+  tasksChanged: boolean;
   /** T3 is killing the CLI; the kill path, not the rejected request, ends the turn. */
   forcedStop: boolean;
   interruptRequested: boolean;
@@ -375,7 +381,12 @@ type Inbox =
       readonly exit: Exit.Exit<unknown, ProviderAdapter.ProviderAdapterProtocolError>;
     }
   | { readonly type: "plan"; readonly markdown: string }
-  | { readonly type: "drained"; readonly turn: ActiveTurn }
+  | {
+      readonly type: "drained";
+      readonly turn: ActiveTurn;
+      /** Whether Copilot still lists a running task; undefined when it could not say. */
+      readonly busy: boolean | undefined;
+    }
   | { readonly type: "exited"; readonly client: CopilotSdkClient }
   | {
       readonly type: "question";
@@ -394,6 +405,7 @@ const SUBAGENT_TOOL = "task";
 // report_intent drives Copilot's status line; exit_plan_mode shows as the proposed plan.
 const HIDDEN_TOOLS = new Set(["report_intent", "exit_plan_mode"]);
 const QUESTION_ID = "answer";
+const QUESTION_DECLINED = "The user declined to answer.";
 // With T3's MCP server the main agent delegates through delegate_task, so T3 owns child threads,
 // waits and restarts. Copilot matches these as runtime tool names; builtin: patterns do not apply
 // here, and MCP tools are always <server>-<tool>, so they cannot collide.
@@ -610,8 +622,9 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       });
       /** Kills the client's process tree; returns why it may not all have stopped. */
       const terminate = Effect.fnUntraced(function* (target: CopilotSdkClient) {
+        // Once the process exited its pid can be recycled, so only a live process is ours to kill.
         const failure =
-          platform === "win32" && target.process !== undefined
+          platform === "win32" && target.process !== undefined && !target.process.hasExited()
             ? yield* killProcessTree(target.process.id)
             : undefined;
         yield* Effect.tryPromise(() => target.forceStop()).pipe(
@@ -1144,11 +1157,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         const prompt = stringField(tool.arguments, "prompt") ?? "";
         const model = stringField(tool.arguments, "model") ?? null;
         const time = yield* DateTime.now;
-        const identity = `${sessionId}:task:${tool.toolCallId}`;
+        const identity = `${options.instanceId}:${sessionId}:task:${tool.toolCallId}`;
+        // The derived thread id already carries the instance.
         const childThreadId = idAllocator.derive.threadFromProviderThread({
           driver: DRIVER,
           providerInstanceId: options.instanceId,
-          nativeThreadId: identity,
+          nativeThreadId: `${sessionId}:task:${tool.toolCallId}`,
         });
         const rootNodeId = idAllocator.derive.nodeFromProviderItem({
           driver: DRIVER,
@@ -1190,7 +1204,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             rootNodeId,
             sharesRootNode: true,
             // Copilot's message and tool ids are unique within the session, child items included.
-            identity: sessionId,
+            identity: `${options.instanceId}:${sessionId}`,
             ordinalBase: 100,
             appThread,
             modelSelection,
@@ -1400,25 +1414,6 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         if (active === entry.turn && pending.size === 0) yield* updateSession("running");
         return true;
       });
-      // Only for requests Copilot or the turn's end settled; T3 persists the ones it answered,
-      // with decision and answers, and republishing would overwrite them.
-      const closeRequest = Effect.fnUntraced(function* (
-        entry: PendingRequest,
-        status: "resolved" | "cancelled",
-      ) {
-        if (!(yield* forgetRequest(entry))) return;
-        const time = yield* DateTime.now;
-        const itemStatus = status === "resolved" ? "completed" : "cancelled";
-        entry.request = {
-          ...entry.request,
-          status,
-          resolvedAt: time,
-          responseCapability: { type: "not_resumable", reason: "This Copilot request has ended." },
-        };
-        entry.node = { ...entry.node, status: itemStatus, completedAt: time };
-        entry.item = { ...entry.item, status: itemStatus, completedAt: time, updatedAt: time };
-        yield* showRequest(entry);
-      });
       const requestPermission = Effect.fnUntraced(function* (
         turn: ActiveTurn,
         data: SessionEventPayload<"permission.requested">["data"],
@@ -1494,16 +1489,13 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             updatedAt: time,
           });
         }
+        // Requests close locally only; T3 owns their persisted state (see permission.completed).
         for (const entry of pending.values()) {
           if (entry.turn !== turn) continue;
-          if (entry.answered) {
-            yield* forgetRequest(entry);
-            continue;
-          }
-          if (entry.native.type === "question") {
+          if (!entry.answered && entry.native.type === "question") {
             entry.native.reject(new Error("The T3 Code turn ended before the user answered."));
           }
-          yield* closeRequest(entry, "cancelled");
+          yield* forgetRequest(entry);
         }
         const completedAt = yield* DateTime.now;
         const usage = turn.providerTurn.turnTokenUsage;
@@ -1691,12 +1683,9 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             const requestId = pendingPermissions.get(event.data.requestId);
             const entry = requestId === undefined ? undefined : pending.get(requestId);
             if (entry === undefined) return;
-            if (entry.answered) return void (yield* forgetRequest(entry));
-            // Settled without T3's answer, by a rule, hook or the runtime.
-            return yield* closeRequest(
-              entry,
-              event.data.result.kind.startsWith("approved") ? "resolved" : "cancelled",
-            );
+            // Only cleared here: T3 may already have persisted the user's answer, before it
+            // reaches this adapter, and republishing the request would overwrite it.
+            return void (yield* forgetRequest(entry));
           }
           case "assistant.usage": {
             // Turn usage is the main agent's; a child's calls are its own.
@@ -1799,7 +1788,33 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             turn.lastError = event.data;
             // After the request settled, nothing else reports a follow-up run's failure.
             if (turn.requestSettled) return yield* finish(turn, "failed", event.data.message);
+            // A steer runs on its own only once the request's run idled, so this error is the
+            // follow-up's; the request can still settle successfully after it.
+            if (turn.followUpRunning) {
+              turn.followUpFailure = event.data;
+              turn.followUpRunning = false;
+            }
             return;
+          case "session.warning": {
+            if (!root) return;
+            const time = yield* DateTime.now;
+            yield* publishItem(turn.scope, "system", {
+              ...baseItem(turn.scope, `warning:${event.id}`, time, "completed"),
+              type: "system_notice",
+              title: "Copilot warning",
+              message: event.data.message,
+            });
+            // A policy-blocked prompt gets this warning instead of a user.message.
+            const blocked = event.data.originatingMessageId;
+            if (blocked !== undefined && turn.steers.delete(blocked)) return yield* complete(turn);
+            return;
+          }
+          case "session.background_tasks_changed":
+            if (!root) return;
+            if (turn.draining) turn.tasksChanged = true;
+            if (!turn.drainWaiting) return;
+            turn.drainWaiting = false;
+            return yield* complete(turn);
           case "user.message":
             if (!root || event.data.messageId === undefined) return;
             if (!turn.steers.delete(event.data.messageId)) return;
@@ -1842,17 +1857,29 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       /** Ends a settled turn once Copilot owes nothing for it. */
       const complete = Effect.fnUntraced(function* (turn: ActiveTurn) {
         if (!turn.requestSettled || turn.steers.size > 0 || turn.followUpRunning) return;
+        if (turn.followUpFailure !== undefined) {
+          return yield* finish(turn, "failed", turn.followUpFailure.message);
+        }
         if (turn.mode !== "autopilot") return yield* finish(turn, "completed");
         if (turn.draining) return;
         // Autopilot completion does not wait for attached shells or background agents.
         turn.draining = true;
+        turn.drainWaiting = false;
+        turn.tasksChanged = false;
         const target = session;
         if (target === undefined) return yield* finish(turn, "completed");
+        // waitForPending also returns on its own timeout, so the task list decides.
         yield* Effect.tryPromise(() => target.rpc.tasks.waitForPending()).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("Could not wait for Copilot's background work", cause),
           ),
-          Effect.andThen(Queue.offer(inbox, { type: "drained", turn })),
+          Effect.andThen(
+            Effect.tryPromise(() => target.rpc.tasks.list()).pipe(
+              Effect.map(({ tasks }) => tasks.some((task) => task.status === "running")),
+              Effect.orElseSucceed(() => undefined),
+            ),
+          ),
+          Effect.flatMap((busy) => Queue.offer(inbox, { type: "drained", turn, busy })),
           Effect.forkIn(sessionScope),
         );
       });
@@ -1889,11 +1916,17 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             case "settled":
               if (active === entry.turn) yield* settle(entry.turn, entry.exit);
               return;
-            case "drained":
-              if (active === entry.turn && !entry.turn.forcedStop) {
-                yield* finish(entry.turn, "completed");
-              }
+            case "drained": {
+              const turn = entry.turn;
+              if (active !== turn || turn.forcedStop) return;
+              turn.draining = false;
+              // A steer may have started a run while the drain waited; that run ends the turn.
+              if (turn.steers.size > 0 || turn.followUpRunning) return;
+              if (entry.busy === false) return yield* finish(turn, "completed");
+              if (turn.tasksChanged) return yield* complete(turn);
+              turn.drainWaiting = true;
               return;
+            }
             case "exited": {
               if (entry.client !== client || closed) return;
               markBroken();
@@ -2221,7 +2254,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         const settings = copilotSessionSettings(turnInput.modelSelection, turnInput.runtimePolicy);
         yield* applySettings(target, settings);
         // Short native ids, as ACP uses: T3's run-attempt ids would nest into every item id.
-        const nativeTurnId = `${target.sessionId}:turn:${turnInput.providerTurnOrdinal}`;
+        // Instances can resume the same Copilot session; ids are global, so they carry the instance.
+        const nativeTurnId = `${options.instanceId}:${target.sessionId}:turn:${turnInput.providerTurnOrdinal}`;
         const startedAt = yield* DateTime.now;
         const providerTurnId = idAllocator.derive.providerTurn({ driver: DRIVER, nativeTurnId });
         const turn: ActiveTurn = {
@@ -2246,7 +2280,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             providerTurnId,
             rootNodeId: turnInput.rootNodeId,
             sharesRootNode: false,
-            identity: target.sessionId,
+            identity: `${options.instanceId}:${target.sessionId}`,
             ordinalBase: turnInput.providerTurnOrdinal * 100,
             appThread: turnInput.appThread,
             modelSelection: turnInput.modelSelection,
@@ -2261,7 +2295,10 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           steers: new Set(),
           followUpRunning: false,
           requestSettled: false,
+          followUpFailure: undefined,
           draining: false,
+          drainWaiting: false,
+          tasksChanged: false,
           forcedStop: false,
           interruptRequested: false,
           lastError: undefined,
@@ -2298,6 +2335,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         const target = session;
         if (!entry || !target) return yield* protocolError("This Copilot request is not pending");
         if (entry.native.type === "question") {
+          // The legacy ask_user callback has no decline result; an answer saying so unblocks it.
+          if (args.decision === "cancel" || args.decision === "decline") {
+            entry.answered = true;
+            entry.native.resolve({ answer: QUESTION_DECLINED, wasFreeform: true });
+            return yield* forgetRequest(entry).pipe(eventPermit.withPermits(1), Effect.asVoid);
+          }
           const raw = args.answers?.[QUESTION_ID];
           const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw[0] : undefined;
           if (typeof text !== "string" || text.trim().length === 0) {
