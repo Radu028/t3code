@@ -24,6 +24,7 @@ export interface CopilotSdkSession {
       "setMode" | "handlePendingPermissionRequest"
     >;
     readonly tasks: Pick<CopilotSession["rpc"]["tasks"], "waitForPending" | "list">;
+    readonly history: Pick<CopilotSession["rpc"]["history"], "compact">;
   };
 }
 
@@ -51,15 +52,22 @@ export interface CopilotProcess {
 const STDIO_CLOSE_TIMEOUT_MS = 5_000;
 
 /**
- * Tracks the SDK's CLI child. Its exit alone is too early: notifications can still sit in
- * stdout or in the connection's queue, so this waits for stdio to close, then for the
+ * Tracks the SDK client's CLI child. Its exit alone is too early: notifications can still sit
+ * in stdout or in the connection's queue, so this waits for stdio to close, then for the
  * connection's drain, the barrier the SDK itself awaits before it marks sessions disconnected.
  */
-export function copilotProcess(
-  child: NodeChildProcess.ChildProcess,
-  drain: (() => Promise<unknown>) | undefined,
-): CopilotProcess | undefined {
-  if (child.pid === undefined) return undefined;
+export function copilotClientProcess(client: object): CopilotProcess | undefined {
+  // SDK 1.0.28 has no exit notification, pid accessor or drain hook; its CLI child and its
+  // connection (with a memoized drain()) are private fields.
+  const child: unknown = Reflect.get(client, "cliProcess");
+  const connection: unknown = Reflect.get(client, "connection");
+  const drain: unknown =
+    typeof connection === "object" && connection !== null
+      ? Reflect.get(connection, "drain")
+      : undefined;
+  if (!(child instanceof NodeChildProcess.ChildProcess) || child.pid === undefined) {
+    return undefined;
+  }
   const hasExited = () => child.exitCode !== null || child.signalCode !== null;
   const stdioClosed = new Promise<void>((resolve) => {
     if (hasExited()) return resolve();
@@ -70,7 +78,7 @@ export function copilotProcess(
     id: child.pid,
     hasExited,
     exited: stdioClosed
-      .then(() => drain?.())
+      .then(() => (typeof drain === "function" ? Reflect.apply(drain, connection, []) : undefined))
       .then(
         () => undefined,
         () => undefined,
@@ -97,28 +105,12 @@ export const makeCopilotSdkClient: MakeCopilotSdkClient = async (options) => {
     useLoggedInUser: true,
   });
   await client.start();
-  // SDK 1.0.28 has no exit notification, pid accessor or drain hook; its CLI child and its
-  // connection (with a memoized drain()) are private fields.
-  const child: unknown = Reflect.get(client, "cliProcess");
-  const connection: unknown = Reflect.get(client, "connection");
-  const drainConnection: unknown =
-    typeof connection === "object" && connection !== null
-      ? Reflect.get(connection, "drain")
-      : undefined;
   return {
     createSession: (config) => client.createSession(config),
     resumeSession: (sessionId, config) => client.resumeSession(sessionId, config),
     stop: () => client.stop(),
     forceStop: () => client.forceStop(),
-    process:
-      child instanceof NodeChildProcess.ChildProcess
-        ? copilotProcess(
-            child,
-            typeof drainConnection === "function"
-              ? () => Promise.resolve(Reflect.apply(drainConnection, connection, []))
-              : undefined,
-          )
-        : undefined,
+    process: copilotClientProcess(client),
   };
 };
 

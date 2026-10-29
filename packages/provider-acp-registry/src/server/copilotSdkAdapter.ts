@@ -198,6 +198,7 @@ type UserInputRequest = Parameters<UserInputHandler>[0];
 type UserInputResponse = Awaited<ReturnType<UserInputHandler>>;
 type ToolCompletion = SessionEventPayload<"tool.execution_complete">["data"];
 type CopilotError = SessionEventPayload<"session.error">["data"];
+type CompactResult = Awaited<ReturnType<CopilotSdkSession["rpc"]["history"]["compact"]>>;
 
 const REASONING_EFFORTS: ReadonlyArray<CopilotReasoningEffort> = [
   "low",
@@ -345,6 +346,8 @@ interface ActiveTurn {
   drainWaiting: boolean;
   /** Background tasks changed while a drain was in flight, so its task list may be stale. */
   tasksChanged: boolean;
+  /** Drains in a row whose task list Copilot could not return. */
+  listFailures: number;
   /** T3 is killing the CLI; the kill path, not the rejected request, ends the turn. */
   forcedStop: boolean;
   interruptRequested: boolean;
@@ -382,6 +385,11 @@ type Inbox =
     }
   | { readonly type: "plan"; readonly markdown: string }
   | {
+      readonly type: "compacted";
+      readonly turn: ActiveTurn;
+      readonly exit: Exit.Exit<CompactResult, ProviderAdapter.ProviderAdapterProtocolError>;
+    }
+  | {
       readonly type: "drained";
       readonly turn: ActiveTurn;
       /** Whether Copilot still lists a running task; undefined when it could not say. */
@@ -412,6 +420,8 @@ const QUESTION_DECLINED = "The user declined to answer.";
 const COPILOT_DELEGATION_TOOLS = ["task", "read_agent", "write_agent", "list_agents"];
 // Models with a long-context tier use it; a model switch drops the tier unless it is passed again.
 const CONTEXT_TIER = "long_context";
+// Drains that may fail to list Copilot's tasks before an autopilot turn ends without knowing.
+const DRAIN_LIST_ATTEMPTS = 3;
 const PLAN_CAPTURED_FEEDBACK =
   "T3 Code captured your proposed plan. Stop here and wait for the user's feedback or implementation request in a later turn.";
 
@@ -1414,6 +1424,19 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         if (active === entry.turn && pending.size === 0) yield* updateSession("running");
         return true;
       });
+      /** Closes a request Copilot stopped waiting on; one T3 answered keeps the answer T3 saved. */
+      const closeRequest = Effect.fnUntraced(function* (
+        entry: PendingRequest,
+        outcome: "resolved" | "cancelled",
+      ) {
+        if (!(yield* forgetRequest(entry)) || entry.answered) return;
+        const time = yield* DateTime.now;
+        const status = outcome === "resolved" ? "completed" : "cancelled";
+        entry.request = { ...entry.request, status: outcome, resolvedAt: time };
+        entry.node = { ...entry.node, status, completedAt: time };
+        entry.item = { ...entry.item, status, completedAt: time, updatedAt: time };
+        yield* showRequest(entry);
+      });
       const requestPermission = Effect.fnUntraced(function* (
         turn: ActiveTurn,
         data: SessionEventPayload<"permission.requested">["data"],
@@ -1489,10 +1512,14 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             updatedAt: time,
           });
         }
-        // Requests close locally only; T3 owns their persisted state (see permission.completed).
+        // T3 dismisses a turn's open questions itself when it ends, but not its approvals.
         for (const entry of pending.values()) {
           if (entry.turn !== turn) continue;
-          if (!entry.answered && entry.native.type === "question") {
+          if (entry.native.type === "permission") {
+            yield* closeRequest(entry, "cancelled");
+            continue;
+          }
+          if (!entry.answered) {
             entry.native.reject(new Error("The T3 Code turn ended before the user answered."));
           }
           yield* forgetRequest(entry);
@@ -1683,9 +1710,10 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             const requestId = pendingPermissions.get(event.data.requestId);
             const entry = requestId === undefined ? undefined : pending.get(requestId);
             if (entry === undefined) return;
-            // Only cleared here: T3 may already have persisted the user's answer, before it
-            // reaches this adapter, and republishing the request would overwrite it.
-            return void (yield* forgetRequest(entry));
+            return yield* closeRequest(
+              entry,
+              event.data.result.kind.startsWith("approved") ? "resolved" : "cancelled",
+            );
           }
           case "assistant.usage": {
             // Turn usage is the main agent's; a child's calls are its own.
@@ -1922,10 +1950,49 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               turn.draining = false;
               // A steer may have started a run while the drain waited; that run ends the turn.
               if (turn.steers.size > 0 || turn.followUpRunning) return;
-              if (entry.busy === false) return yield* finish(turn, "completed");
+              // Work can start after Copilot listed the tasks; only a fresh drain can end the turn.
               if (turn.tasksChanged) return yield* complete(turn);
+              if (entry.busy === undefined) {
+                if (++turn.listFailures < DRAIN_LIST_ATTEMPTS) return yield* complete(turn);
+                return yield* finish(
+                  turn,
+                  "failed",
+                  "Copilot did not report whether its background work finished.",
+                );
+              }
+              turn.listFailures = 0;
+              if (!entry.busy) return yield* finish(turn, "completed");
               turn.drainWaiting = true;
               return;
+            }
+            case "compacted": {
+              const turn = entry.turn;
+              if (active !== turn || turn.forcedStop) return;
+              if (Exit.isFailure(entry.exit)) return yield* settle(turn, entry.exit);
+              const result = entry.exit.value;
+              // Copilot reports the compaction through its events; this settles one they left open.
+              const compaction = turn.compaction;
+              turn.compaction = undefined;
+              if (compaction !== undefined) {
+                const time = yield* DateTime.now;
+                const summary = result.summaryContent?.trim();
+                const afterTokenCount = result.contextWindow?.currentTokens;
+                yield* publishItem(turn.scope, "system", {
+                  ...compaction,
+                  status: result.success ? "completed" : "failed",
+                  ...(summary ? { summary } : {}),
+                  ...(afterTokenCount === undefined ? {} : { afterTokenCount }),
+                  completedAt: time,
+                  updatedAt: time,
+                });
+              }
+              if (result.success) return yield* settle(turn, Exit.void);
+              if (turn.interruptRequested) return yield* finish(turn, "interrupted");
+              return yield* finish(
+                turn,
+                "failed",
+                turn.lastError?.message ?? "Copilot could not compact the conversation.",
+              );
             }
             case "exited": {
               if (entry.client !== client || closed) return;
@@ -2071,6 +2138,9 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           workingDirectory: cwd,
           streaming: true,
           contextTier: CONTEXT_TIER,
+          // The CLI finds personal and project skills on its own; an SDK session only when asked.
+          // The config passed here still wins over what it discovers.
+          enableConfigDiscovery: true,
           systemMessage: systemMessage(mcp),
           ...(mcp === undefined
             ? {}
@@ -2183,7 +2253,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           if (confirmation !== undefined) {
             applied = {};
             return yield* protocolError(
-              `Copilot did not switch to ${confirmation.targetModelDisplayName}: the conversation (${confirmation.currentTokens} tokens) must be compacted to fit its ${confirmation.targetLimit}-token limit first`,
+              `Copilot did not switch to ${confirmation.targetModelDisplayName}: the conversation (${confirmation.currentTokens} tokens) does not fit its ${confirmation.targetLimit}-token limit. Send /compact, then try again.`,
             );
           }
           // A deferred switch is queued ahead of the prompt but not applied yet.
@@ -2236,23 +2306,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         } satisfies MessageOptions;
       });
 
-      const start = Effect.fnUntraced(function* (
+      /** Makes the input T3's active turn on this session; the caller then sends its request. */
+      const beginTurn = Effect.fnUntraced(function* (
+        target: CopilotSdkSession,
         turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        mode: CopilotMode,
       ) {
-        const target = session;
-        if (!target || !validateThread(turnInput.providerThread) || closed) {
-          return yield* protocolError("This thread is not attached to the Copilot session");
-        }
-        if (active) {
-          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-            driver: DRIVER,
-            detail: "Copilot already has an active turn; queue through the orchestrator",
-            reason: "previous_turn_active",
-          });
-        }
-        const message = yield* prompt(turnInput.message);
-        const settings = copilotSessionSettings(turnInput.modelSelection, turnInput.runtimePolicy);
-        yield* applySettings(target, settings);
         // Short native ids, as ACP uses: T3's run-attempt ids would nest into every item id.
         // Instances can resume the same Copilot session; ids are global, so they carry the instance.
         const nativeTurnId = `${options.instanceId}:${target.sessionId}:turn:${turnInput.providerTurnOrdinal}`;
@@ -2272,7 +2331,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             completedAt: null,
           },
           nativeTurnId,
-          mode: settings.mode,
+          mode,
           scope: makeScope({
             threadId: turnInput.threadId,
             runId: turnInput.runId,
@@ -2299,6 +2358,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           draining: false,
           drainWaiting: false,
           tasksChanged: false,
+          listFailures: 0,
           forcedStop: false,
           interruptRequested: false,
           lastError: undefined,
@@ -2314,6 +2374,33 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           });
           yield* updateSession("running");
         }).pipe(eventPermit.withPermits(1));
+        return turn;
+      });
+      const idleSession = Effect.fnUntraced(function* (
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+      ) {
+        const target = session;
+        if (!target || !validateThread(turnInput.providerThread) || closed) {
+          return yield* protocolError("This thread is not attached to the Copilot session");
+        }
+        if (active) {
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: DRIVER,
+            detail: "Copilot already has an active turn; queue through the orchestrator",
+            reason: "previous_turn_active",
+          });
+        }
+        return target;
+      });
+
+      const start = Effect.fnUntraced(function* (
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+      ) {
+        const target = yield* idleSession(turnInput);
+        const message = yield* prompt(turnInput.message);
+        const settings = copilotSessionSettings(turnInput.modelSelection, turnInput.runtimePolicy);
+        yield* applySettings(target, settings);
+        const turn = yield* beginTurn(target, turnInput, settings.mode);
         // sendAndWait correlates completion with this request, waits out autopilot and background
         // agents, and rejects when the CLI exits. The SDK resolves it after dispatching the
         // completion event, so offering from its callbacks keeps the outcome right behind it.
@@ -2324,6 +2411,24 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               type: "settled",
               turn,
               exit: Exit.fail(protocolError("Copilot could not finish the turn", cause)),
+            }),
+        );
+      });
+      // The turn's model is not applied first: a switch Copilot refused for a too-large context
+      // is the reason to compact, and the compaction runs on the current model.
+      const compact = Effect.fnUntraced(function* (
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+      ) {
+        const target = yield* idleSession(turnInput);
+        const turn = yield* beginTurn(target, turnInput, "interactive");
+        void target.rpc.history.compact({ trigger: "manual" }).then(
+          (result) =>
+            Queue.offerUnsafe(inbox, { type: "compacted", turn, exit: Exit.succeed(result) }),
+          (cause: unknown) =>
+            Queue.offerUnsafe(inbox, {
+              type: "compacted",
+              turn,
+              exit: Exit.fail(protocolError("Copilot could not compact the conversation", cause)),
             }),
         );
       });
@@ -2364,11 +2469,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                   ...(args.feedback?.trim() ? { feedback: args.feedback.trim() } : {}),
                 };
         const requestId = entry.native.requestId;
-        // Set first: Copilot's permission.completed can arrive before the response returns.
+        // T3 saved the answer before delivering it, even if this response fails. Set first:
+        // Copilot's permission.completed can arrive before the response returns.
         entry.answered = true;
         yield* call("permission response", () =>
           target.rpc.permissions.handlePendingPermissionRequest({ requestId, result }),
-        ).pipe(Effect.tapError(() => Effect.sync(() => (entry.answered = false))));
+        );
         yield* forgetRequest(entry).pipe(eventPermit.withPermits(1));
       });
 
@@ -2412,6 +2518,20 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           ),
         startTurn: (args) =>
           start(args).pipe(
+            commands.withPermits(1),
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: DRIVER,
+                  threadId: args.threadId,
+                  providerThreadId: args.providerThread.id,
+                  runId: args.runId,
+                  cause,
+                }),
+            ),
+          ),
+        compactThread: (args) =>
+          compact(args).pipe(
             commands.withPermits(1),
             Effect.mapError(
               (cause) =>

@@ -1,8 +1,15 @@
-// @effect-diagnostics nodeBuiltinImport:off -- copilotProcess wraps a Node ChildProcess.
+// @effect-diagnostics nodeBuiltinImport:off -- copilotClientProcess wraps a Node ChildProcess.
 import * as NodeChildProcess from "node:child_process";
-import type { ResumeSessionConfig, SessionConfig, SessionEvent } from "@github/copilot-sdk";
+import * as NodeStream from "node:stream";
+import {
+  CopilotClient,
+  RuntimeConnection,
+  type ResumeSessionConfig,
+  type SessionConfig,
+  type SessionEvent,
+} from "@github/copilot-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, it, vi } from "@effect/vitest";
 import {
   EnvironmentId,
   MessageId,
@@ -36,7 +43,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { AcpRegistrySettings } from "../settings.ts";
 import {
-  copilotProcess,
+  copilotClientProcess,
   copilotSdkCliCandidates,
   type CopilotSdkClient,
   type CopilotSdkClientOptions,
@@ -68,6 +75,9 @@ const selection = (options: ModelSelection["options"] = []): ModelSelection => (
 });
 
 const COPILOT_MESSAGE_ID = "b6593215-0d4f-4c2e-9a51-3f0e7c2d1a44";
+const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
+
+type CompactResult = Awaited<ReturnType<CopilotSdkSession["rpc"]["history"]["compact"]>>;
 
 // Only fields the projection reads; the rest of each event is runtime bookkeeping.
 const event = { id: "event", parentId: null, timestamp: "2026-10-29T00:00:00.000Z" } as const;
@@ -86,6 +96,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   };
   let config: SessionConfig | ResumeSessionConfig | undefined;
   let finishRun: ((error?: Error) => void) | undefined;
+  let finishCompaction: ((result: CompactResult) => void) | undefined;
   const launches: Array<CopilotSdkClientOptions> = [];
   const resumes: Array<{ readonly sessionId: string; readonly config: ResumeSessionConfig }> = [];
   const resumeFailures: Array<Error> = [];
@@ -96,6 +107,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   // Each held drain gates one waitForPending call, in order.
   const drainGates: Array<Promise<void>> = [];
   let runningTasks: Awaited<ReturnType<CopilotSdkSession["rpc"]["tasks"]["list"]>>["tasks"] = [];
+  let failedLists = 0;
   const switchResults: Array<Awaited<ReturnType<CopilotSdkSession["rpc"]["model"]["switchTo"]>>> =
     [];
   const gate = () => {
@@ -168,7 +180,19 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         },
         list: async () => {
           record("tasks.list");
+          if (failedLists > 0) {
+            failedLists -= 1;
+            throw new Error("tasks.list failed");
+          }
           return { tasks: runningTasks };
+        },
+      },
+      history: {
+        compact: (params) => {
+          record("history.compact", params);
+          return new Promise((resolve) => {
+            finishCompaction = resolve;
+          });
         },
       },
     },
@@ -228,6 +252,9 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       drainGates.push(held.promise);
       return held.release;
     },
+    failTaskLists: (count: number) => {
+      failedLists = count;
+    },
     setRunningTasks: (count: number) => {
       runningTasks = Array.from({ length: count }, (_, index) => ({
         type: "shell" as const,
@@ -255,6 +282,8 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
     },
     emit: (sdkEvent: SessionEvent) => Effect.sync(() => config?.onEvent?.(sdkEvent)),
     finishRun: (error?: Error) => Effect.sync(() => finishRun?.(error)),
+    finishCompaction: (result: CompactResult) => Effect.sync(() => finishCompaction?.(result)),
+    nextCall: Queue.take(calls),
     takeCall: Effect.fnUntraced(function* (method: string) {
       while (true) {
         const call = yield* Queue.take(calls);
@@ -285,10 +314,48 @@ const makeHarness = Effect.fnUntraced(function* (
     runtimePolicy: policy,
   });
   const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+  // Every write T3 would persist, in order: the adapter's events and T3's own saved answers.
+  const writes: Array<
+    | ProviderAdapter.ProviderAdapterV2Event
+    | { readonly type: "t3.answered"; readonly requestId: string; readonly declined: boolean }
+  > = [];
   yield* runtime.events.pipe(
-    Stream.runForEach((item) => Queue.offer(emitted, item)),
+    Stream.runForEach((item) => {
+      writes.push(item);
+      return Queue.offer(emitted, item);
+    }),
     Effect.forkScoped,
   );
+  // T3 saves an answer (request resolved, card settled) before it delivers it to the adapter.
+  const respond = (input: ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput) =>
+    Effect.suspend(() => {
+      const declined = input.decision === "decline" || input.decision === "cancel";
+      writes.push({ type: "t3.answered", requestId: input.requestId, declined });
+      return runtime.respondToRuntimeRequest(input);
+    });
+  /** A request's stored status and its card's: T3's projections upsert, so the last write wins. */
+  const persisted = (requestId: string) => {
+    let request: string | undefined;
+    let card: string | undefined;
+    for (const write of writes) {
+      if (write.type === "t3.answered" && write.requestId === requestId) {
+        request = "resolved";
+        card = write.declined ? "cancelled" : "completed";
+      }
+      if (write.type === "runtime_request.updated" && write.runtimeRequest.id === requestId) {
+        request = write.runtimeRequest.status;
+      }
+      if (
+        write.type === "turn_item.updated" &&
+        (write.turnItem.type === "approval_request" ||
+          write.turnItem.type === "user_input_request") &&
+        write.turnItem.requestId === requestId
+      ) {
+        card = write.turnItem.status;
+      }
+    }
+    return { request, card };
+  };
   const providerThread = yield* runtime.ensureThread({
     threadId: THREAD_ID,
     modelSelection: selection(),
@@ -322,7 +389,16 @@ const makeHarness = Effect.fnUntraced(function* (
     }
   });
   const untilTerminal = () => until((item) => item.type === "turn.terminal");
-  return { runtime, providerThread, takeRunningTurn, takeEvent, until, untilTerminal };
+  return {
+    runtime,
+    providerThread,
+    respond,
+    persisted,
+    takeRunningTurn,
+    takeEvent,
+    until,
+    untilTerminal,
+  };
 });
 
 const turnInput = Effect.fnUntraced(function* (
@@ -376,6 +452,31 @@ const turnInput = Effect.fnUntraced(function* (
 
 const turnItems = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
   events.flatMap((item) => (item.type === "turn_item.updated" ? [item.turnItem] : []));
+
+/** A request's card, the adapter's last event when it opens one. */
+const isCard = (requestId: string) => (item: ProviderAdapter.ProviderAdapterV2Event) =>
+  item.type === "turn_item.updated" &&
+  (item.turnItem.type === "approval_request" || item.turnItem.type === "user_input_request") &&
+  item.turnItem.requestId === requestId;
+
+const shellPermission = (requestId: string, command: string) =>
+  ({
+    ...event,
+    type: "permission.requested",
+    data: {
+      requestId,
+      permissionRequest: {
+        kind: "shell",
+        intention: "Run",
+        fullCommandText: command,
+        commands: [{ identifier: command, readOnly: false }],
+        canOfferSessionApproval: false,
+        hasWriteFileRedirection: false,
+        possiblePaths: [],
+        possibleUrls: [],
+      },
+    },
+  }) satisfies SessionEvent;
 
 describe("CopilotSdkAdapterV2", () => {
   it("runs the Copilot binary behind npm's Windows shim without a shell", () => {
@@ -754,10 +855,12 @@ describe("CopilotSdkAdapterV2", () => {
       const fake = yield* makeFakeCopilot();
       const releaseFirstDrain = fake.holdDrain();
       const releaseSecondDrain = fake.holdDrain();
+      const releaseThirdDrain = fake.holdDrain();
       const harness = yield* makeHarness(fake);
-      const input = yield* turnInput(harness.providerThread, [
+      const autopilot = [
         { id: "mode", value: "https://agentclientprotocol.com/protocol/session-modes#autopilot" },
-      ]);
+      ];
+      const input = yield* turnInput(harness.providerThread, autopilot);
       yield* harness.runtime.startTurn(input);
       const turnId = (yield* harness.takeRunningTurn()).id;
       yield* fake.takeCall("sendAndWait");
@@ -791,6 +894,24 @@ describe("CopilotSdkAdapterV2", () => {
         data: {},
       });
       yield* fake.takeCall("tasks.waitForPending");
+      // A shell starts while that drain runs, after Copilot already listed no running tasks.
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_start",
+        data: { toolCallId: "bg-late", toolName: "bash", arguments: { command: "pnpm build" } },
+      });
+      yield* fake.emit({
+        ...event,
+        type: "session.background_tasks_changed",
+        ephemeral: true,
+        data: {},
+      });
+      yield* releaseSecondDrain;
+      const afterStaleList = yield* Effect.race(
+        fake.takeCall("tasks.waitForPending").pipe(Effect.as("drained again")),
+        harness.takeEvent((item) => item.type === "turn.terminal").pipe(Effect.as("ended")),
+      );
+      assert.strictEqual(afterStaleList, "drained again");
       // A steer during that drain starts its own run, which then decides the ending.
       yield* harness.runtime.steerTurn({
         threadId: THREAD_ID,
@@ -804,7 +925,17 @@ describe("CopilotSdkAdapterV2", () => {
         type: "user.message",
         data: { messageId: "steer-message", content: "Also lint", delivery: "idle" },
       });
-      yield* releaseSecondDrain;
+      yield* releaseThirdDrain;
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_complete",
+        data: {
+          toolCallId: "bg-late",
+          success: true,
+          result: { content: "built" },
+          shellExecution: { exitCode: 0 },
+        },
+      });
       yield* fake.emit({
         ...event,
         type: "assistant.message",
@@ -827,6 +958,17 @@ describe("CopilotSdkAdapterV2", () => {
         ),
       );
       assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
+
+      // A task list Copilot cannot return gets a few fresh drains, then ends the turn.
+      fake.failTaskLists(3);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, autopilot, 2));
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.finishRun();
+      yield* Effect.all(Array.from({ length: 3 }, () => fake.takeCall("tasks.list")));
+      const ended = (yield* harness.untilTerminal()).at(-1);
+      if (ended?.type !== "turn.terminal") return assert.fail("no terminal");
+      assert.strictEqual(ended.status, "failed");
+      assert.include(ended.failure?.message, "background work");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -1055,27 +1197,54 @@ describe("CopilotSdkAdapterV2", () => {
       });
       const smaller = yield* turnInput(harness.providerThread, [], 3);
       const gpt = { ...smaller, modelSelection: { ...smaller.modelSelection, model: "gpt-5.5" } };
-      assert.strictEqual(
-        (yield* harness.runtime.startTurn(gpt).pipe(Effect.result))._tag,
-        "Failure",
+      const refused = yield* harness.runtime.startTurn(gpt).pipe(Effect.flip);
+      assert.include(
+        isProtocolError(refused.cause) ? refused.cause.detail : undefined,
+        "Send /compact",
       );
-      yield* harness.runtime.startTurn({ ...gpt, providerTurnOrdinal: 4 });
-      assert.deepStrictEqual(
-        [
-          (yield* fake.takeCall("model.switchTo")).args,
-          (yield* fake.takeCall("model.switchTo")).args,
-        ],
-        [
-          [{ modelId: "gpt-5.5", reasoningEffort: null, contextTier: "long_context" }],
-          [{ modelId: "gpt-5.5", reasoningEffort: null, contextTier: "long_context" }],
-        ],
+      const switchToGpt = [
+        { modelId: "gpt-5.5", reasoningEffort: null, contextTier: "long_context" },
+      ];
+      assert.deepStrictEqual((yield* fake.takeCall("model.switchTo")).args, switchToGpt);
+      // /compact runs on the current model, without retrying the switch it makes room for.
+      const compactThread = harness.runtime.compactThread;
+      if (!compactThread) return assert.fail("no compactThread");
+      yield* compactThread({
+        ...gpt,
+        providerTurnOrdinal: 4,
+        message: { ...gpt.message, text: "/compact" },
+      });
+      assert.deepInclude(yield* fake.nextCall, {
+        method: "history.compact",
+        args: [{ trigger: "manual" }],
+      });
+      yield* fake.emit({
+        ...event,
+        type: "session.compaction_start",
+        data: { compactionAttemptId: "manual-1", currentTokens: 180000 },
+      });
+      // Copilot's result settles a compaction its events left open.
+      yield* fake.finishCompaction({
+        success: true,
+        tokensRemoved: 140000,
+        messagesRemoved: 30,
+        summaryContent: "Fixed the build",
+        contextWindow: { tokenLimit: 1000000, currentTokens: 40000, messagesLength: 4 },
+      });
+      const compacted = yield* harness.untilTerminal();
+      assert.deepInclude(
+        turnItems(compacted).findLast((item) => item.type === "compaction"),
+        { status: "completed", beforeTokenCount: 180000, afterTokenCount: 40000 },
       );
+      assert.deepInclude(compacted.at(-1), { type: "turn.terminal", status: "completed" });
+      yield* harness.runtime.startTurn({ ...gpt, providerTurnOrdinal: 5 });
+      assert.deepStrictEqual((yield* fake.takeCall("model.switchTo")).args, switchToGpt);
       yield* fake.takeCall("sendAndWait");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
   it.effect(
-    "opens Copilot sessions with T3's system message, MCP server, delegation and tier",
+    "opens Copilot sessions with T3's system message, MCP server, delegation, tier and discovery",
     () =>
       Effect.gen(function* () {
         yield* (yield* McpProviderSessions.McpProviderSessions).set({
@@ -1147,8 +1316,10 @@ describe("CopilotSdkAdapterV2", () => {
           ["/opt/copilot/bin/copilot"],
         );
         // With T3's MCP server the main agent delegates through delegate_task, on create and resume.
+        // Discovery loads the user's skills as the CLI does, also on both.
         const delegation = {
           contextTier: "long_context",
+          enableConfigDiscovery: true,
           defaultAgent: { excludedTools: ["task", "read_agent", "write_agent", "list_agents"] },
         } satisfies Partial<SessionConfig>;
         assert.deepInclude(config, delegation);
@@ -1159,7 +1330,10 @@ describe("CopilotSdkAdapterV2", () => {
         yield* (yield* McpProviderSessions.McpProviderSessions).clear(THREAD_ID);
         const native = yield* makeFakeCopilot();
         yield* makeHarness(native);
-        assert.deepInclude(native.config(), { contextTier: "long_context" });
+        assert.deepInclude(native.config(), {
+          contextTier: "long_context",
+          enableConfigDiscovery: true,
+        });
         assert.notProperty(native.config(), "defaultAgent");
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
@@ -1443,10 +1617,8 @@ describe("CopilotSdkAdapterV2", () => {
       assert.deepInclude(shown.runtimeRequest, { kind: "command", status: "pending" });
       assert.strictEqual(shown.runtimeRequest.nativeRequestRef?.nativeId, "perm-shell");
       const shell = shown.runtimeRequest.id;
-      yield* harness.runtime.respondToRuntimeRequest({
-        requestId: shell,
-        decision: "acceptForSession",
-      });
+      yield* harness.takeEvent(isCard(shell));
+      yield* harness.respond({ requestId: shell, decision: "acceptForSession" });
       assert.deepStrictEqual(
         (yield* fake.takeCall("permissions.handlePendingPermissionRequest")).args,
         [
@@ -1471,32 +1643,9 @@ describe("CopilotSdkAdapterV2", () => {
       );
       const question = afterShell.at(-1);
       if (question?.type !== "runtime_request.updated") return assert.fail("no question");
-      yield* harness.runtime.respondToRuntimeRequest({
-        requestId: question.runtimeRequest.id,
-        answers: { answer: "B" },
-      });
+      yield* harness.takeEvent(isCard(question.runtimeRequest.id));
+      yield* harness.respond({ requestId: question.runtimeRequest.id, answers: { answer: "B" } });
       assert.deepStrictEqual(yield* Fiber.join(answered), { answer: "B", wasFreeform: false });
-      // T3 persisted both answers (decision, questionAnswer); republishing would overwrite them.
-      yield* fake.emit({
-        ...event,
-        type: "assistant.message",
-        data: { messageId: "after-requests", content: "Done" },
-      });
-      const after = yield* harness.until(
-        (item) => item.type === "turn_item.updated" && item.turnItem.type === "assistant_message",
-      );
-      const answeredIds = new Set<string>([shell, question.runtimeRequest.id]);
-      const republished = [...afterShell, ...after].filter(
-        (item) =>
-          (item.type === "runtime_request.updated" &&
-            answeredIds.has(item.runtimeRequest.id) &&
-            item.runtimeRequest.status !== "pending") ||
-          (item.type === "turn_item.updated" &&
-            (item.turnItem.type === "approval_request" ||
-              item.turnItem.type === "user_input_request") &&
-            item.turnItem.status !== "waiting"),
-      );
-      assert.deepStrictEqual(republished, []);
 
       // Cancelling a question still settles Copilot's callback, or Copilot keeps waiting.
       const declined = yield* Effect.promise(async () =>
@@ -1509,75 +1658,115 @@ describe("CopilotSdkAdapterV2", () => {
           item.runtimeRequest.id !== question.runtimeRequest.id,
       );
       if (second.type !== "runtime_request.updated") return assert.fail("no second question");
-      yield* harness.runtime.respondToRuntimeRequest({
-        requestId: second.runtimeRequest.id,
-        decision: "cancel",
-      });
+      yield* harness.takeEvent(isCard(second.runtimeRequest.id));
+      yield* harness.respond({ requestId: second.runtimeRequest.id, decision: "cancel" });
       assert.deepStrictEqual(yield* Fiber.join(declined), {
         answer: "The user declined to answer.",
         wasFreeform: true,
       });
 
-      // A request still open when the turn ends stays T3's: T3 may already have saved its answer.
-      yield* fake.emit({
-        ...event,
-        type: "permission.requested",
-        data: {
-          requestId: "perm-late",
-          permissionRequest: {
-            kind: "shell",
-            intention: "Deploy",
-            fullCommandText: "pnpm deploy",
-            commands: [{ identifier: "pnpm deploy", readOnly: false }],
-            canOfferSessionApproval: false,
-            hasWriteFileRedirection: false,
-            possiblePaths: [],
-            possibleUrls: [],
-          },
-        },
-      });
-      const late = yield* harness.takeEvent(
-        (item) =>
-          item.type === "runtime_request.updated" &&
-          item.runtimeRequest.nativeRequestRef?.nativeId === "perm-late",
-      );
-      if (late.type !== "runtime_request.updated") return assert.fail("no late request");
-      yield* fake.finishRun();
-      const ending = yield* harness.untilTerminal();
-      assert.isFalse(
-        ending.some(
+      // Copilot can stop waiting on an approval T3 never answered, and a turn can end on one.
+      const opened = Effect.fnUntraced(function* (nativeId: string) {
+        const request = yield* harness.takeEvent(
           (item) =>
             item.type === "runtime_request.updated" &&
-            item.runtimeRequest.id === late.runtimeRequest.id,
+            item.runtimeRequest.nativeRequestRef?.nativeId === nativeId,
+        );
+        return request.type === "runtime_request.updated" ? request.runtimeRequest.id : "";
+      });
+      yield* fake.emit(shellPermission("perm-gone", "pnpm publish"));
+      const gone = yield* opened("perm-gone");
+      yield* fake.emit({
+        ...event,
+        type: "permission.completed",
+        data: { requestId: "perm-gone", result: { kind: "cancelled" } },
+      });
+      yield* fake.emit(shellPermission("perm-late", "pnpm deploy"));
+      const late = yield* opened("perm-late");
+      yield* fake.finishRun();
+      yield* harness.untilTerminal();
+      // Saved answers stay as T3 saved them; requests nobody answered close.
+      assert.deepStrictEqual(
+        [shell, question.runtimeRequest.id, second.runtimeRequest.id, gone, late].map(
+          harness.persisted,
         ),
+        [
+          { request: "resolved", card: "completed" },
+          { request: "resolved", card: "completed" },
+          { request: "resolved", card: "cancelled" },
+          { request: "cancelled", card: "cancelled" },
+          { request: "cancelled", card: "cancelled" },
+        ],
       );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it("reports Copilot's exit only after stdio closed and the SDK drained its notifications", async () => {
-    const child = new NodeChildProcess.ChildProcess();
-    Object.defineProperty(child, "pid", { value: 4242 });
-    let drained: () => void = () => {};
-    const tracked = copilotProcess(
-      child,
-      () =>
-        new Promise<void>((resolve) => {
-          drained = resolve;
-        }),
-    );
-    let exited = false;
-    void tracked?.exited.then(() => {
-      exited = true;
-    });
-    Object.defineProperty(child, "exitCode", { value: 1 });
-    child.emit("exit", 1, null);
-    assert.isTrue(tracked?.hasExited());
-    child.emit("close", 1, null);
-    await Promise.resolve();
-    // Notifications read before the exit may still be queued in the SDK's connection.
-    assert.isFalse(exited);
-    drained();
-    await tracked?.exited;
-    assert.isTrue(exited);
+  it("reports Copilot's exit after its stdio closes or 5 seconds pass, then the SDK's drain", async () => {
+    // A real SDK client on in-memory pipes; T3 reads its private CLI child and connection.
+    const connect = async () => {
+      const client = new CopilotClient({
+        connection: RuntimeConnection.forStdio({ path: "copilot" }),
+        useLoggedInUser: false,
+      });
+      const child = new NodeChildProcess.ChildProcess();
+      Object.defineProperty(child, "pid", { value: 4242 });
+      Object.assign(child, {
+        stdin: new NodeStream.PassThrough(),
+        stdout: new NodeStream.PassThrough(),
+      });
+      Reflect.set(client, "cliProcess", child);
+      const connectViaStdio: unknown = Reflect.get(client, "connectToChildProcessViaStdio");
+      if (typeof connectViaStdio !== "function") return assert.fail("The SDK cannot connect");
+      await Reflect.apply(connectViaStdio, client, []);
+      const tracked = copilotClientProcess(client);
+      if (!tracked) return assert.fail("Copilot's process is not tracked");
+      const exit = () => {
+        Object.defineProperty(child, "exitCode", { value: 1 });
+        child.emit("exit", 1, null);
+      };
+      // The SDK memoizes drain(): this is the barrier it awaits before it disconnects sessions.
+      const drain = () => {
+        const connection: unknown = Reflect.get(client, "connection");
+        const sdkDrain: unknown =
+          typeof connection === "object" && connection !== null
+            ? Reflect.get(connection, "drain")
+            : undefined;
+        if (typeof sdkDrain !== "function") return assert.fail("The SDK connection has no drain");
+        return Promise.resolve(Reflect.apply(sdkDrain, connection, []));
+      };
+      return { child, tracked, exit, drain };
+    };
+
+    const cli = await connect();
+    assert.strictEqual(cli.tracked.id, 4242);
+    assert.isFalse(cli.tracked.hasExited());
+    cli.exit();
+    assert.isTrue(cli.tracked.hasExited());
+    cli.child.emit("close", 1, null);
+    // Without the drain, the exit would show within microtasks, ahead of the barrier.
+    const first = await Promise.race([
+      cli.tracked.exited.then(() => "exited"),
+      cli.drain().then(() => "drained"),
+    ]);
+    assert.strictEqual(first, "drained");
+
+    // A grandchild can hold stdout open, so an exit without a close counts after 5 seconds.
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const orphaned = await connect();
+      let exited = false;
+      void orphaned.tracked.exited.then(() => {
+        exited = true;
+      });
+      // Drained up front, so only the wait for stdio is left once Copilot exits.
+      await orphaned.drain();
+      orphaned.exit();
+      await vi.advanceTimersByTimeAsync(4_999);
+      assert.isFalse(exited);
+      await vi.advanceTimersByTimeAsync(1);
+      await orphaned.tracked.exited;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
