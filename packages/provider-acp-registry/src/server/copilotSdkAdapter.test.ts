@@ -102,6 +102,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   const resumeFailures: Array<Error> = [];
   let created = 0;
   let hangAbort = false;
+  let stopFails = false;
   let sendGate: Promise<void> | undefined;
   let exitGate: Promise<void> | undefined;
   // Each held drain gates one waitForPending call, in order.
@@ -226,6 +227,9 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       forceStop: async () => {
         record("forceStop");
         finishRun?.(new Error("Session disconnected while waiting for a response"));
+        if (stopFails) {
+          throw new Error("Timed out waiting for CLI process to exit after SIGKILL: 10000ms");
+        }
         await exitGate;
         exitProcess();
       },
@@ -272,6 +276,10 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
     config: () => config,
     hangAbort: () => {
       hangAbort = true;
+    },
+    /** SIGKILL does not end the CLI, so forceStop rejects and the process stays alive. */
+    failForceStop: () => {
+      stopFails = true;
     },
     holdSend: () => {
       let release!: () => void;
@@ -658,6 +666,40 @@ describe("CopilotSdkAdapterV2", () => {
       assert.strictEqual(terminal.failure.class, "usage_limit");
       assert.strictEqual(terminal.failure.message, "Rate limit exceeded");
       assert.strictEqual(terminal.threadDisposition, "reusable");
+
+      // In autopilot a shell can outlive the failed request, so T3 stops Copilot first.
+      fake.setRunningTasks(1);
+      yield* harness.runtime.startTurn(
+        yield* turnInput(
+          harness.providerThread,
+          [
+            {
+              id: "mode",
+              value: "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+            },
+          ],
+          2,
+        ),
+      );
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_start",
+        data: { toolCallId: "edits", toolName: "powershell", arguments: { command: "./fix.ps1" } },
+      });
+      yield* fake.emit({
+        ...event,
+        type: "session.error",
+        data: { errorType: "rate_limit", message: "Rate limit exceeded", statusCode: 429 },
+      });
+      yield* fake.finishRun(new Error("Rate limit exceeded"));
+      const stopped = (yield* harness.untilTerminal()).at(-1);
+      if (stopped?.type !== "turn.terminal" || stopped.status !== "failed") {
+        return assert.fail("expected a failed turn");
+      }
+      assert.strictEqual(stopped.threadDisposition, "broken");
+      assert.strictEqual(stopped.failure.class, "usage_limit");
+      assert.isTrue(fake.called("forceStop"));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -1150,6 +1192,29 @@ describe("CopilotSdkAdapterV2", () => {
       yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
       assert.strictEqual(fake.launches.length, 2);
       assert.strictEqual(spawned.length, 1);
+
+      // This time the CLI outlives taskkill and SIGKILL. The turn still ends, but no second CLI
+      // starts next to it.
+      fake.failForceStop();
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, [], 2));
+      const stuckTurn = (yield* harness.takeRunningTurn()).id;
+      yield* fake.takeCall("sendAndWait");
+      const interruptingStuck = yield* harness.runtime
+        .interruptTurn({ providerThread: harness.providerThread, providerTurnId: stuckTurn })
+        .pipe(Effect.forkScoped);
+      yield* fake.takeCall("abort");
+      yield* TestClock.adjust("30 seconds");
+      yield* Fiber.join(interruptingStuck);
+      const relaunch = yield* harness.runtime
+        .resumeThread({ providerThread: harness.providerThread })
+        .pipe(Effect.result);
+      assert.strictEqual(relaunch._tag, "Failure");
+      assert.strictEqual(fake.launches.length, 2);
+      yield* harness.takeEvent(
+        (item) =>
+          item.type === "provider_session.updated" &&
+          (item.providerSession.lastError ?? "").includes("is still running"),
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

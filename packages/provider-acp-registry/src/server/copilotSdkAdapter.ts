@@ -348,6 +348,10 @@ interface ActiveTurn {
   tasksChanged: boolean;
   /** Drains in a row whose task list Copilot could not return. */
   listFailures: number;
+  /** An autopilot turn that ended without completing, until T3 knows its background work stopped. */
+  ending:
+    | { readonly status: "failed" | "cancelled" | "interrupted"; readonly detail?: string }
+    | undefined;
   /** T3 is killing the CLI; the kill path, not the rejected request, ends the turn. */
   forcedStop: boolean;
   interruptRequested: boolean;
@@ -633,14 +637,21 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       /** Kills the client's process tree; returns why it may not all have stopped. */
       const terminate = Effect.fnUntraced(function* (target: CopilotSdkClient) {
         // Once the process exited its pid can be recycled, so only a live process is ours to kill.
-        const failure =
+        const treeFailure =
           platform === "win32" && target.process !== undefined && !target.process.hasExited()
             ? yield* killProcessTree(target.process.id)
             : undefined;
-        yield* Effect.tryPromise(() => target.forceStop()).pipe(
+        // forceStop rejects when the CLI outlives its SIGKILL.
+        const stopped = yield* Effect.tryPromise(() => target.forceStop()).pipe(
           Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
-          Effect.ignore,
+          Effect.map(Option.isSome),
+          Effect.orElseSucceed(() => false),
         );
+        const failure = stopped
+          ? treeFailure
+          : treeFailure === undefined
+            ? "Copilot did not exit"
+            : `${treeFailure}, Copilot did not exit`;
         if (failure !== undefined) {
           yield* Effect.logWarning("Copilot's process tree may still be running", { failure });
         }
@@ -1551,7 +1562,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         active = undefined;
         if (status === "failed") {
           const failure = makeProviderFailure({
-            class: disposition === "broken" ? "transport_error" : failureClass(turn.lastError),
+            // A turn T3 stopped after it failed keeps that failure's class, such as a usage limit.
+            class:
+              disposition === "broken" && turn.ending === undefined
+                ? "transport_error"
+                : failureClass(turn.lastError),
             message: detail ?? "Copilot could not finish the turn.",
             ...(turn.lastError?.errorCode === undefined ? {} : { code: turn.lastError.errorCode }),
           });
@@ -1586,9 +1601,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       /** Kills the CLI, then ends the turn as broken, so the next turn starts a fresh process. */
       const killTurn = Effect.fnUntraced(function* (
         turn: ActiveTurn,
-        status: "interrupted" | "failed",
+        status: "failed" | "cancelled" | "interrupted",
         detail?: string,
       ) {
+        // A second stop, such as an interrupt's deadline during a release, waits for the first.
+        if (turn.forcedStop) return yield* Deferred.await(turn.done);
         // forceStop rejects the request before the process is gone; forcedStop keeps that
         // rejection, and any event until the kill finishes, from ending the turn.
         turn.forcedStop = true;
@@ -1600,6 +1617,35 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             yield* updateSession("error", `Copilot's processes may still be running (${failure})`);
           }
         }).pipe(eventPermit.withPermits(1));
+      });
+
+      /**
+       * Ends a turn that did not complete. Autopilot shells and background agents outlive the
+       * request, so T3 takes the thread back only once Copilot lists none running; otherwise it
+       * stops Copilot first.
+       */
+      const release = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        status: "failed" | "cancelled" | "interrupted",
+        detail?: string,
+      ) {
+        const target = session;
+        if (turn.mode !== "autopilot" || target === undefined) {
+          return yield* finish(turn, status, detail);
+        }
+        if (turn.ending !== undefined) return;
+        turn.ending = { status, ...(detail === undefined ? {} : { detail }) };
+        yield* Effect.tryPromise(() => target.rpc.tasks.list()).pipe(
+          Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
+          Effect.map((listed) =>
+            Option.isSome(listed)
+              ? listed.value.tasks.some((task) => task.status === "running")
+              : undefined,
+          ),
+          Effect.orElseSucceed(() => undefined),
+          Effect.flatMap((busy) => Queue.offer(inbox, { type: "drained", turn, busy })),
+          Effect.forkIn(sessionScope),
+        );
       });
 
       // Projection runs per SDK event inside the session's span; a span per event is noise.
@@ -1834,7 +1880,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             if (!root) return;
             turn.lastError = event.data;
             // After the request settled, nothing else reports a follow-up run's failure.
-            if (turn.requestSettled) return yield* finish(turn, "failed", event.data.message);
+            if (turn.requestSettled) return yield* release(turn, "failed", event.data.message);
             // A steer runs on its own only once the request's run idled, so this error is the
             // follow-up's; the request can still settle successfully after it.
             if (turn.followUpRunning) {
@@ -1883,10 +1929,10 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             turn.followUpRunning = false;
             if (!turn.requestSettled) return;
             if (event.data.reason === "error") {
-              return yield* finish(turn, "failed", turn.lastError?.message);
+              return yield* release(turn, "failed", turn.lastError?.message);
             }
             if (event.data.reason === "aborted") {
-              return yield* finish(turn, turn.interruptRequested ? "interrupted" : "cancelled");
+              return yield* release(turn, turn.interruptRequested ? "interrupted" : "cancelled");
             }
             return yield* complete(turn);
         }
@@ -1905,7 +1951,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       const complete = Effect.fnUntraced(function* (turn: ActiveTurn) {
         if (!turn.requestSettled || turn.steers.size > 0 || turn.followUpRunning) return;
         if (turn.followUpFailure !== undefined) {
-          return yield* finish(turn, "failed", turn.followUpFailure.message);
+          return yield* release(turn, "failed", turn.followUpFailure.message);
         }
         if (turn.mode !== "autopilot") return yield* finish(turn, "completed");
         if (turn.draining) return;
@@ -1940,15 +1986,15 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           turn.requestSettled = true;
           return yield* complete(turn);
         }
-        if (turn.interruptRequested) return yield* finish(turn, "interrupted");
+        if (turn.interruptRequested) return yield* release(turn, "interrupted");
         const failure = Cause.squash(exit.cause);
         const reason = errorText(isProtocolError(failure) ? failure.cause : failure);
         if (/\bdisconnected\b/i.test(reason ?? "")) {
           markBroken();
           return yield* finish(turn, "failed", "Copilot stopped unexpectedly.", "broken");
         }
-        if (/\baborted\b/i.test(reason ?? "")) return yield* finish(turn, "cancelled");
-        yield* finish(turn, "failed", turn.lastError?.message ?? reason);
+        if (/\baborted\b/i.test(reason ?? "")) return yield* release(turn, "cancelled");
+        yield* release(turn, "failed", turn.lastError?.message ?? reason);
       });
       const handleInbox = Effect.fnUntraced(
         function* (entry: Inbox) {
@@ -1966,6 +2012,15 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             case "drained": {
               const turn = entry.turn;
               if (active !== turn || turn.forcedStop) return;
+              const ending = turn.ending;
+              if (ending !== undefined) {
+                if (entry.busy === false) return yield* finish(turn, ending.status, ending.detail);
+                // Forked: the kill path waits for this event permit.
+                return yield* killTurn(turn, ending.status, ending.detail).pipe(
+                  Effect.forkIn(sessionScope),
+                  Effect.asVoid,
+                );
+              }
               turn.draining = false;
               // A steer may have started a run while the drain waited; that run ends the turn.
               if (turn.steers.size > 0 || turn.followUpRunning) return;
@@ -2126,7 +2181,16 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           yield* Effect.tryPromise(() => replaced.disconnect()).pipe(Effect.ignore);
         }
         if (broken) {
-          yield* terminate(client);
+          const failure = yield* terminate(client);
+          // A second CLI would write to the same workspace as the one that would not stop.
+          const alive =
+            client.process === undefined ? failure !== undefined : !client.process.hasExited();
+          if (alive) {
+            const pid = client.process === undefined ? "" : ` (process ${client.process.id})`;
+            const detail = `Copilot${pid} is still running after T3 tried to stop it. End it, then try again.`;
+            yield* updateSession("error", detail).pipe(eventPermit.withPermits(1));
+            return yield* protocolError(detail);
+          }
           client = yield* launchClient;
           broken = false;
           yield* observeExit(client);
@@ -2380,6 +2444,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           drainWaiting: false,
           tasksChanged: false,
           listFailures: 0,
+          ending: undefined,
           forcedStop: false,
           interruptRequested: false,
           lastError: undefined,
