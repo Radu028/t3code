@@ -17,6 +17,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -70,7 +71,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   const calls = yield* Queue.unbounded<Call>();
   const record = (method: string, ...args: ReadonlyArray<unknown>) =>
     Queue.offerUnsafe(calls, { method, args });
-  let onEvent: SessionConfig["onEvent"];
+  let config: SessionConfig | ResumeSessionConfig | undefined;
   let finishRun: ((error?: Error) => void) | undefined;
   const launches: Array<CopilotSdkClientOptions> = [];
   const resumes: Array<{ readonly sessionId: string; readonly config: ResumeSessionConfig }> = [];
@@ -107,21 +108,25 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
           record("permissions.setMode", params);
           return { success: true, mode: params.mode };
         },
+        handlePendingPermissionRequest: async (params) => {
+          record("permissions.handlePendingPermissionRequest", params);
+          return { success: true };
+        },
       },
     },
   };
   const client: CopilotSdkClient = {
-    createSession: async (config) => {
-      record("createSession", config);
-      onEvent = config.onEvent;
+    createSession: async (created) => {
+      record("createSession", created);
+      config = created;
       return session;
     },
-    resumeSession: async (sessionId, config) => {
+    resumeSession: async (sessionId, resumed) => {
       record("resumeSession", sessionId);
-      resumes.push({ sessionId, config });
+      resumes.push({ sessionId, config: resumed });
       const failure = resumeFailures.shift();
       if (failure) throw failure;
-      onEvent = config.onEvent;
+      config = resumed;
       return session;
     },
     stop: async () => [],
@@ -135,7 +140,8 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       launches.push(options);
       return client;
     },
-    emit: (sdkEvent: SessionEvent) => Effect.sync(() => onEvent?.(sdkEvent)),
+    config: () => config,
+    emit: (sdkEvent: SessionEvent) => Effect.sync(() => config?.onEvent?.(sdkEvent)),
     finishRun: (error?: Error) => Effect.sync(() => finishRun?.(error)),
     takeCall: Effect.fnUntraced(function* (method: string) {
       while (true) {
@@ -183,6 +189,14 @@ const makeHarness = Effect.fnUntraced(function* (
       }
     }
   });
+  const takeEvent = Effect.fnUntraced(function* (
+    matches: (item: ProviderAdapter.ProviderAdapterV2Event) => boolean,
+  ) {
+    while (true) {
+      const next = yield* Queue.take(emitted);
+      if (matches(next)) return next;
+    }
+  });
   const untilTerminal = Effect.fnUntraced(function* () {
     const seen: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
     while (true) {
@@ -191,7 +205,7 @@ const makeHarness = Effect.fnUntraced(function* (
       if (next.type === "turn.terminal") return seen;
     }
   });
-  return { runtime, providerThread, takeRunningTurn, untilTerminal };
+  return { runtime, providerThread, takeRunningTurn, takeEvent, untilTerminal };
 });
 
 const turnInput = Effect.fnUntraced(function* (
@@ -524,6 +538,310 @@ describe("CopilotSdkAdapterV2", () => {
         fake.launches.map((launch) => launch.cliPath),
         ["/opt/copilot/bin/copilot"],
       );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+  it.effect("runs Copilot tasks as subagents with their own child threads", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      yield* fake.takeCall("sendAndWait");
+      const agent = { agentName: "explore", agentDisplayName: "Explore", agentDescription: "" };
+      for (const sdkEvent of [
+        {
+          ...event,
+          type: "tool.execution_start",
+          data: {
+            toolCallId: "task-sync",
+            toolName: "task",
+            arguments: { prompt: "Find the bug", description: "Find bug", agent_type: "explore" },
+          },
+        },
+        {
+          ...event,
+          agentId: "agent-1",
+          type: "subagent.started",
+          data: { ...agent, toolCallId: "task-sync" },
+        },
+        {
+          ...event,
+          agentId: "agent-1",
+          type: "assistant.message",
+          data: { messageId: "c1", content: "Looking" },
+        },
+        {
+          ...event,
+          agentId: "agent-1",
+          type: "tool.execution_start",
+          data: { toolCallId: "c-t1", toolName: "grep", arguments: { pattern: "TODO" } },
+        },
+        {
+          ...event,
+          type: "tool.execution_start",
+          data: {
+            toolCallId: "task-bg",
+            toolName: "task",
+            arguments: { prompt: "Run tests", mode: "background", agent_type: "task" },
+          },
+        },
+        {
+          ...event,
+          agentId: "agent-2",
+          type: "subagent.started",
+          data: { ...agent, toolCallId: "task-bg" },
+        },
+        // A background task's call settles at launch; the agent keeps running.
+        {
+          ...event,
+          type: "tool.execution_complete",
+          data: { toolCallId: "task-bg", success: true, result: { content: "Agent started" } },
+        },
+        {
+          ...event,
+          agentId: "agent-2",
+          type: "assistant.message",
+          data: { messageId: "c2", content: "Tests pass" },
+        },
+        {
+          ...event,
+          agentId: "agent-1",
+          type: "subagent.completed",
+          data: { ...agent, toolCallId: "task-sync", cancelled: true },
+        },
+        {
+          ...event,
+          agentId: "agent-2",
+          type: "subagent.completed",
+          data: { ...agent, toolCallId: "task-bg" },
+        },
+      ] satisfies ReadonlyArray<SessionEvent>) {
+        yield* fake.emit(sdkEvent);
+      }
+      yield* fake.finishRun();
+      const events = yield* harness.untilTerminal();
+      const subagents = events.flatMap((item) =>
+        item.type === "subagent.updated" ? [item.subagent] : [],
+      );
+      const last = (task: string) =>
+        subagents.findLast((item) => item.nativeTaskRef?.nativeId === task);
+      assert.deepInclude(last("task-sync"), { status: "cancelled", prompt: "Find the bug" });
+      assert.deepInclude(last("task-bg"), { status: "completed", result: "Tests pass" });
+      const childThreadId = last("task-sync")?.childThreadId;
+      const childItems = turnItems(events).filter((item) => item.threadId === childThreadId);
+      assert.deepStrictEqual(
+        childItems.map((item) => [item.type, item.status]),
+        [
+          ["user_message", "completed"],
+          ["assistant_message", "completed"],
+          ["file_search", "running"],
+          ["file_search", "cancelled"],
+        ],
+      );
+      assert.isTrue(
+        events.some(
+          (item) => item.type === "app_thread.created" && item.appThread.id === childThreadId,
+        ),
+      );
+      assert.isFalse(
+        turnItems(events).some(
+          (item) => item.threadId === THREAD_ID && item.type === "assistant_message",
+        ),
+      );
+      assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("counts the main agent's usage once and tracks context and compaction", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      yield* fake.takeCall("sendAndWait");
+      const usage = (usageId: string, inputTokens: number) => ({
+        model: "claude-sonnet-4.5",
+        inputTokens,
+        outputTokens: 10,
+        cacheReadTokens: 5,
+        accounting: { sequence: 1, sourceSessionId: "copilot-native-1", usageId },
+      });
+      for (const sdkEvent of [
+        { ...event, type: "assistant.usage", ephemeral: true, data: usage("call-1", 100) },
+        { ...event, type: "assistant.usage", ephemeral: true, data: usage("call-1", 100) },
+        { ...event, type: "assistant.usage", ephemeral: true, data: usage("call-2", 50) },
+        {
+          ...event,
+          agentId: "child",
+          type: "assistant.usage",
+          ephemeral: true,
+          data: usage("child-1", 900),
+        },
+        {
+          ...event,
+          type: "session.usage_info",
+          ephemeral: true,
+          data: { currentTokens: 1200, tokenLimit: 200000, messagesLength: 4 },
+        },
+        {
+          ...event,
+          type: "session.compaction_start",
+          data: { compactionAttemptId: "c1", currentTokens: 150000 },
+        },
+        {
+          ...event,
+          type: "session.compaction_complete",
+          data: {
+            compactionAttemptId: "c1",
+            success: true,
+            preCompactionTokens: 150000,
+            postCompactionTokens: 20000,
+            summaryContent: "Summary",
+          },
+        },
+      ] satisfies ReadonlyArray<SessionEvent>) {
+        yield* fake.emit(sdkEvent);
+      }
+      yield* fake.finishRun();
+      const events = yield* harness.untilTerminal();
+      const turn = events.findLast((item) => item.type === "provider_turn.updated");
+      assert.deepInclude(
+        turn?.type === "provider_turn.updated" ? turn.providerTurn.turnTokenUsage : undefined,
+        {
+          usageStatus: "complete",
+          inputTokens: 150,
+          outputTokens: 20,
+          cachedInputTokens: 10,
+        },
+      );
+      const context = events.findLast(
+        (item) =>
+          item.type === "provider_thread.updated" && item.providerThread.contextUsage !== null,
+      );
+      assert.deepStrictEqual(
+        context?.type === "provider_thread.updated"
+          ? context.providerThread.contextUsage
+          : undefined,
+        { usedTokens: 1200, maxTokens: 200000 },
+      );
+      const compaction = turnItems(events).filter((item) => item.type === "compaction");
+      assert.deepStrictEqual(
+        compaction.map(
+          (item) =>
+            item.type === "compaction" && [
+              item.status,
+              item.beforeTokenCount,
+              item.afterTokenCount,
+            ],
+        ),
+        [
+          ["running", 150000, undefined],
+          ["completed", 150000, 20000],
+        ],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("captures exit_plan_mode as a proposed plan and tells Copilot to stop", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      yield* fake.takeCall("sendAndWait");
+      const handler = fake.config()?.onExitPlanModeRequest;
+      if (!handler) return assert.fail("exit_plan_mode handler missing");
+      const answer = yield* Effect.promise(async () =>
+        handler(
+          {
+            summary: "Plan",
+            planContent: "1. Fix it",
+            actions: ["autopilot"],
+            recommendedAction: "autopilot",
+          },
+          { sessionId: "copilot-native-1" },
+        ),
+      );
+      assert.strictEqual(answer.approved, false);
+      const plan = yield* harness.takeEvent(
+        (item) => item.type === "turn_item.updated" && item.turnItem.type === "proposed_plan",
+      );
+      assert.deepInclude(plan.type === "turn_item.updated" ? plan.turnItem : undefined, {
+        markdown: "1. Fix it",
+        status: "completed",
+      });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("routes approvals and questions to T3 runtime requests", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.emit({
+        ...event,
+        type: "permission.requested",
+        data: {
+          requestId: "perm-read",
+          permissionRequest: { kind: "read", intention: "Read", path: "/etc/hosts" },
+        },
+      });
+      assert.deepStrictEqual(
+        (yield* fake.takeCall("permissions.handlePendingPermissionRequest")).args,
+        [{ requestId: "perm-read", result: { kind: "approve-once" } }],
+      );
+      yield* fake.emit({
+        ...event,
+        agentId: "child",
+        type: "permission.requested",
+        data: {
+          requestId: "perm-shell",
+          permissionRequest: {
+            kind: "shell",
+            intention: "Install",
+            fullCommandText: "pnpm install",
+            commands: [{ identifier: "pnpm install", readOnly: false }],
+            canOfferSessionApproval: true,
+            hasWriteFileRedirection: false,
+            possiblePaths: [],
+            possibleUrls: [],
+          },
+        },
+      });
+      const shown = yield* harness.takeEvent((item) => item.type === "runtime_request.updated");
+      if (shown.type !== "runtime_request.updated") return assert.fail("no request");
+      assert.deepInclude(shown.runtimeRequest, { kind: "command", status: "pending" });
+      assert.strictEqual(shown.runtimeRequest.nativeRequestRef?.nativeId, "perm-shell");
+      yield* harness.runtime.respondToRuntimeRequest({
+        requestId: shown.runtimeRequest.id,
+        decision: "acceptForSession",
+      });
+      assert.deepStrictEqual(
+        (yield* fake.takeCall("permissions.handlePendingPermissionRequest")).args,
+        [
+          {
+            requestId: "perm-shell",
+            result: {
+              kind: "approve-for-session",
+              approval: { kind: "commands", commandIdentifiers: ["pnpm install"] },
+            },
+          },
+        ],
+      );
+
+      const ask = fake.config()?.onUserInputRequest;
+      if (!ask) return assert.fail("ask_user handler missing");
+      const answered = yield* Effect.promise(async () =>
+        ask({ question: "Which one?", choices: ["A", "B"] }, { sessionId: "copilot-native-1" }),
+      ).pipe(Effect.forkScoped);
+      const question = yield* harness.takeEvent(
+        (item) =>
+          item.type === "runtime_request.updated" && item.runtimeRequest.kind === "user_input",
+      );
+      if (question.type !== "runtime_request.updated") return assert.fail("no question");
+      yield* harness.runtime.respondToRuntimeRequest({
+        requestId: question.runtimeRequest.id,
+        answers: { answer: "B" },
+      });
+      assert.deepStrictEqual(yield* Fiber.join(answered), { answer: "B", wasFreeform: false });
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });

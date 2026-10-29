@@ -17,7 +17,10 @@ export interface CopilotSdkSession {
   readonly disconnect: () => Promise<void>;
   readonly rpc: {
     readonly mode: Pick<CopilotSession["rpc"]["mode"], "set">;
-    readonly permissions: Pick<CopilotSession["rpc"]["permissions"], "setMode">;
+    readonly permissions: Pick<
+      CopilotSession["rpc"]["permissions"],
+      "setMode" | "handlePendingPermissionRequest"
+    >;
   };
 }
 

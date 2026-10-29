@@ -1,6 +1,6 @@
 import type {
   MessageOptions,
-  PermissionHandler,
+  PermissionRequest,
   SessionConfig,
   SessionEvent,
   SessionEventPayload,
@@ -9,14 +9,26 @@ import {
   ProviderDriverKind,
   type ModelSelection,
   type NodeId,
+  type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
+  type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
+  type OrchestrationV2RuntimeRequest,
+  type OrchestrationV2Subagent,
   type OrchestrationV2TurnItem,
   type OrchestrationV2TurnItemStatus,
+  type PlanId,
+  type ProviderApprovalOption,
   type ProviderInstanceId,
+  type ProviderRequestKind,
+  type ProviderThreadId,
+  type ProviderTurnId,
+  type RunId,
+  type RuntimeRequestId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { HTML_RENDER_TOOL_NAME } from "@t3tools/shared/htmlRender";
@@ -58,6 +70,11 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
+import {
+  makeSubagentChildThread,
+  makeSubagentConversationArtifacts,
+  subagentThreadTitle,
+} from "@t3tools/provider-core/server/subagentProjection";
 import type { AcpRegistrySettings } from "../settings.ts";
 import type * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import {
@@ -120,25 +137,25 @@ const CopilotSdkCapabilitiesV2 = {
     supportsDynamicToolCallbacks: false,
   },
   approvals: {
-    supportsCommandApproval: false,
-    supportsFileReadApproval: false,
-    supportsFileChangeApproval: false,
+    supportsCommandApproval: true,
+    supportsFileReadApproval: true,
+    supportsFileChangeApproval: true,
     supportsApplyPatchApproval: false,
-    approvalsHaveNativeRequestIds: false,
+    approvalsHaveNativeRequestIds: true,
     approvalCallbacksAreLiveOnly: true,
-    approvalsCanOriginateFromSubagents: false,
+    approvalsCanOriginateFromSubagents: true,
   },
   planning: {
-    emitsPlanUpdated: false,
+    emitsPlanUpdated: true,
     emitsTodoList: false,
-    emitsProposedPlan: false,
-    supportsStructuredQuestions: false,
+    emitsProposedPlan: true,
+    supportsStructuredQuestions: true,
     planDeltasHaveItemIds: false,
   },
   subagents: {
-    supportsSubagents: false,
+    supportsSubagents: true,
     exposesSubagentThreadIds: false,
-    emitsSubagentLifecycle: false,
+    emitsSubagentLifecycle: true,
     canWaitForSubagents: false,
     canCloseSubagents: false,
     canForkSubagentThread: false,
@@ -164,12 +181,18 @@ const CopilotSdkCapabilitiesV2 = {
     nativeThreadIds: "strong",
     nativeTurnIds: "weak",
     nativeItemIds: "strong",
-    nativeRequestIds: "weak",
+    nativeRequestIds: "strong",
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
 type CopilotMode = Parameters<CopilotSdkSession["rpc"]["mode"]["set"]>[0]["mode"];
 type CopilotReasoningEffort = NonNullable<SessionConfig["reasoningEffort"]>;
+type PermissionDecision = Parameters<
+  CopilotSdkSession["rpc"]["permissions"]["handlePendingPermissionRequest"]
+>[0]["result"];
+type UserInputHandler = NonNullable<SessionConfig["onUserInputRequest"]>;
+type UserInputRequest = Parameters<UserInputHandler>[0];
+type UserInputResponse = Awaited<ReturnType<UserInputHandler>>;
 type ToolCompletion = SessionEventPayload<"tool.execution_complete">["data"];
 type CopilotError = SessionEventPayload<"session.error">["data"];
 
@@ -249,28 +272,94 @@ interface ToolCall {
   completion?: ToolCompletion;
 }
 
-interface ActiveTurn {
-  readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
-  providerTurn: OrchestrationV2ProviderTurn;
-  readonly nativeTurnId: string;
+/**
+ * Where items land: the root turn, or a subagent's child thread. Child items have no
+ * run and hang off the child thread's root node, as the shared subagent projection expects.
+ */
+interface ItemScope {
+  readonly threadId: ThreadId;
+  readonly runId: RunId | null;
+  readonly providerThreadId: ProviderThreadId | null;
+  readonly providerTurnId: ProviderTurnId | null;
+  readonly rootNodeId: NodeId;
+  readonly sharesRootNode: boolean;
+  readonly identity: string;
+  readonly ordinalBase: number;
+  readonly appThread: OrchestrationV2AppThread;
+  readonly modelSelection: ModelSelection;
+  /** The root thread, whose MCP session child agents share. */
+  readonly mcpThreadId: ThreadId;
   readonly ordinals: Map<string, number>;
   readonly startedAt: Map<string, DateTime.Utc>;
   readonly texts: Map<string, TextSegment>;
   readonly tools: Map<string, ToolCall>;
   readonly dirty: Set<string>;
-  readonly done: Deferred.Deferred<void>;
   flushScheduled: boolean;
+}
+
+type SubagentStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
+
+interface Subagent {
+  readonly toolCallId: string;
+  readonly parent: ItemScope;
+  readonly scope: ItemScope;
+  readonly background: boolean;
+  readonly prompt: string;
+  title: string;
+  model: string | null;
+  status: SubagentStatus;
+  result: string | null;
+  completedAt: DateTime.Utc | null;
+}
+
+interface ActiveTurn {
+  readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
+  providerTurn: OrchestrationV2ProviderTurn;
+  readonly nativeTurnId: string;
+  readonly scope: ItemScope;
+  readonly subagents: Map<string, Subagent>;
+  readonly agents: Map<string, Subagent>;
+  readonly usageIds: Set<string>;
+  readonly done: Deferred.Deferred<void>;
+  planId: PlanId | undefined;
+  compaction: string | undefined;
   interruptRequested: boolean;
   lastError: CopilotError | undefined;
 }
 
+interface PendingRequest {
+  readonly turn: ActiveTurn;
+  readonly native:
+    | {
+        readonly type: "permission";
+        readonly requestId: string;
+        readonly forSession: PermissionDecision | undefined;
+      }
+    | {
+        readonly type: "question";
+        readonly request: UserInputRequest;
+        readonly resolve: (response: UserInputResponse) => void;
+        readonly reject: (cause: Error) => void;
+      };
+  request: OrchestrationV2RuntimeRequest;
+  node: OrchestrationV2ExecutionNode;
+  item: OrchestrationV2TurnItem;
+}
+
 type Inbox =
   | { readonly type: "event"; readonly epoch: number; readonly event: SessionEvent }
-  | { readonly type: "flush"; readonly turn: ActiveTurn }
+  | { readonly type: "flush"; readonly scope: ItemScope }
   | {
       readonly type: "settled";
       readonly turn: ActiveTurn;
       readonly exit: Exit.Exit<unknown, ProviderAdapter.ProviderAdapterProtocolError>;
+    }
+  | { readonly type: "plan"; readonly markdown: string }
+  | {
+      readonly type: "question";
+      readonly request: UserInputRequest;
+      readonly resolve: (response: UserInputResponse) => void;
+      readonly reject: (cause: Error) => void;
     };
 
 // Copilot CLI's built-in tools, by the row T3 renders for them.
@@ -279,8 +368,12 @@ const EDIT_TOOLS = new Set(["edit", "create", "apply_patch", "str_replace_editor
 const READ_TOOLS = new Set(["view", "read", "read_file"]);
 const SEARCH_TOOLS = new Set(["grep", "glob", "rg", "search"]);
 const FETCH_TOOLS = new Set(["web_fetch", "fetch"]);
-// Copilot reports its status line through this tool; it is not work.
-const HIDDEN_TOOLS = new Set(["report_intent"]);
+const SUBAGENT_TOOL = "task";
+// report_intent drives Copilot's status line; exit_plan_mode shows as the proposed plan.
+const HIDDEN_TOOLS = new Set(["report_intent", "exit_plan_mode"]);
+const QUESTION_ID = "answer";
+const PLAN_CAPTURED_FEEDBACK =
+  "T3 Code captured your proposed plan. Stop here and wait for the user's feedback or implementation request in a later turn.";
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -305,6 +398,9 @@ const nativeRef = (nativeId: string, strength: "strong" | "weak" = "strong") => 
   strength,
 });
 
+const settledStatus = (status: OrchestrationV2TurnItemStatus) =>
+  status !== "running" && status !== "pending" && status !== "waiting";
+
 const failureClass = (error: CopilotError | undefined) =>
   error?.statusCode === 429 || /rate.?limit|quota/i.test(error?.errorType ?? "")
     ? ("usage_limit" as const)
@@ -314,6 +410,78 @@ const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 
 const errorText = (cause: unknown) =>
   cause instanceof Error && cause.message.trim().length > 0 ? cause.message : undefined;
+
+const urlHost = (url: string) => {
+  try {
+    return new URL(url).hostname || undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** The T3 approval card for a Copilot permission request, and its "for this session" grant. */
+function permissionPresentation(request: PermissionRequest): {
+  readonly kind: ProviderRequestKind;
+  readonly prompt: string;
+  readonly forSession: PermissionDecision | undefined;
+} {
+  switch (request.kind) {
+    case "shell":
+      return {
+        kind: "command",
+        prompt: request.fullCommandText,
+        forSession: request.canOfferSessionApproval
+          ? {
+              kind: "approve-for-session",
+              approval: {
+                kind: "commands",
+                commandIdentifiers: request.commands.map((command) => command.identifier),
+              },
+            }
+          : undefined,
+      };
+    case "write":
+      return {
+        kind: "file-change",
+        prompt: request.fileName,
+        forSession: request.canOfferSessionApproval
+          ? { kind: "approve-for-session", approval: { kind: "write" } }
+          : undefined,
+      };
+    case "read":
+      return {
+        kind: "file-read",
+        prompt: request.path,
+        forSession: { kind: "approve-for-session", approval: { kind: "read" } },
+      };
+    case "mcp":
+      return {
+        kind: "permission",
+        prompt: `${request.serverName}.${request.toolName}`,
+        forSession: {
+          kind: "approve-for-session",
+          approval: { kind: "mcp", serverName: request.serverName, toolName: request.toolName },
+        },
+      };
+    case "url": {
+      const host = urlHost(request.url);
+      return {
+        kind: "permission",
+        prompt: request.url,
+        forSession: host ? { kind: "approve-for-session", domain: host } : undefined,
+      };
+    }
+    default:
+      return {
+        kind: "permission",
+        prompt:
+          "toolName" in request && typeof request.toolName === "string"
+            ? request.toolName
+            : `Copilot asks for ${request.kind} permission`,
+        forSession: undefined,
+      };
+  }
+}
 
 export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(function* (
   options: CopilotSdkAdapterV2Options,
@@ -361,7 +529,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
       if (!options.settings.enabled) return yield* protocolError("Copilot is disabled");
-      const scope = yield* Effect.scope;
+      const sessionScope = yield* Effect.scope;
       const requestedCwd = input.runtimePolicy.cwd ?? providerHost.paths.cwd;
       const cwd = yield* fileSystem
         .realPath(requestedCwd)
@@ -430,6 +598,9 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       let applied: Partial<CopilotSessionSettings> = {};
       let currentSettings = copilotSessionSettings(input.modelSelection, input.runtimePolicy);
       let closed = false;
+      let questionCount = 0;
+      const pending = new Map<RuntimeRequestId, PendingRequest>();
+      const pendingPermissions = new Map<string, RuntimeRequestId>();
 
       const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
@@ -447,85 +618,108 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         thread = { ...thread, ...patch, updatedAt: yield* DateTime.now };
         yield* emit({ type: "provider_thread.updated", driver: DRIVER, providerThread: thread });
       });
+      const emitTurn = (turn: ActiveTurn) =>
+        emit({
+          type: "provider_turn.updated",
+          driver: DRIVER,
+          threadId: turn.input.threadId,
+          providerTurn: turn.providerTurn,
+        });
 
-      const itemIdentity = (turn: ActiveTurn, nativeItemId: string) =>
-        `${options.instanceId}:${turn.input.providerThread.id}:${turn.nativeTurnId}:${nativeItemId}`;
+      const makeScope = (fields: {
+        readonly threadId: ThreadId;
+        readonly runId: RunId | null;
+        readonly providerThreadId: ProviderThreadId | null;
+        readonly providerTurnId: ProviderTurnId | null;
+        readonly rootNodeId: NodeId;
+        readonly sharesRootNode: boolean;
+        readonly identity: string;
+        readonly ordinalBase: number;
+        readonly appThread: OrchestrationV2AppThread;
+        readonly modelSelection: ModelSelection;
+        readonly mcpThreadId: ThreadId;
+      }): ItemScope => ({
+        ...fields,
+        ordinals: new Map(),
+        startedAt: new Map(),
+        texts: new Map(),
+        tools: new Map(),
+        dirty: new Set(),
+        flushScheduled: false,
+      });
       const baseItem = (
-        turn: ActiveTurn,
+        scope: ItemScope,
         nativeItemId: string,
         time: DateTime.Utc,
         status: OrchestrationV2TurnItemStatus,
       ) => {
-        if (!turn.ordinals.has(nativeItemId)) {
-          turn.ordinals.set(
-            nativeItemId,
-            turn.input.providerTurnOrdinal * 100 + turn.ordinals.size + 1,
-          );
+        if (!scope.ordinals.has(nativeItemId)) {
+          scope.ordinals.set(nativeItemId, scope.ordinalBase + scope.ordinals.size + 1);
         }
-        if (!turn.startedAt.has(nativeItemId)) turn.startedAt.set(nativeItemId, time);
-        const identity = itemIdentity(turn, nativeItemId);
-        const settled = status !== "running" && status !== "pending" && status !== "waiting";
+        if (!scope.startedAt.has(nativeItemId)) scope.startedAt.set(nativeItemId, time);
+        const identity = `${scope.identity}:${nativeItemId}`;
         return {
           id: idAllocator.derive.turnItemFromProviderItem({
             driver: DRIVER,
             nativeItemId: identity,
           }),
-          nodeId: idAllocator.derive.nodeFromProviderItem({
-            driver: DRIVER,
-            nativeItemId: identity,
-          }),
-          threadId: turn.input.threadId,
-          runId: turn.input.runId,
-          providerThreadId: turn.input.providerThread.id,
-          providerTurnId: turn.providerTurn.id,
+          nodeId: scope.sharesRootNode
+            ? scope.rootNodeId
+            : idAllocator.derive.nodeFromProviderItem({ driver: DRIVER, nativeItemId: identity }),
+          threadId: scope.threadId,
+          runId: scope.runId,
+          providerThreadId: scope.providerThreadId,
+          providerTurnId: scope.providerTurnId,
           nativeItemRef: nativeRef(nativeItemId),
           parentItemId: null,
-          ordinal: turn.ordinals.get(nativeItemId)!,
+          ordinal: scope.ordinals.get(nativeItemId)!,
           status,
           title: null,
-          startedAt: turn.startedAt.get(nativeItemId)!,
-          completedAt: settled ? time : null,
+          startedAt: scope.startedAt.get(nativeItemId)!,
+          completedAt: settledStatus(status) ? time : null,
           updatedAt: time,
         };
       };
       const publishItem = Effect.fnUntraced(function* (
-        turn: ActiveTurn,
-        kind: "assistant_message" | "reasoning" | "tool_call",
+        scope: ItemScope,
+        kind: OrchestrationV2ExecutionNode["kind"],
         turnItem: OrchestrationV2TurnItem & { readonly nodeId: NodeId },
       ) {
-        yield* emit({
-          type: "node.updated",
-          driver: DRIVER,
-          node: {
-            id: turnItem.nodeId,
-            threadId: turnItem.threadId,
-            runId: turnItem.runId,
-            parentNodeId: turn.input.rootNodeId,
-            rootNodeId: turn.input.rootNodeId,
-            kind,
-            status: turnItem.status,
-            countsForRun: false,
-            providerThreadId: turn.input.providerThread.id,
-            providerTurnId: turn.providerTurn.id,
-            nativeItemRef: turnItem.nativeItemRef,
-            runtimeRequestId: null,
-            checkpointScopeId: null,
-            startedAt: turnItem.startedAt,
-            completedAt: turnItem.completedAt,
-          },
-        });
+        if (!scope.sharesRootNode) {
+          yield* emit({
+            type: "node.updated",
+            driver: DRIVER,
+            node: {
+              id: turnItem.nodeId,
+              threadId: scope.threadId,
+              runId: scope.runId,
+              parentNodeId: scope.rootNodeId,
+              rootNodeId: scope.rootNodeId,
+              kind,
+              status: turnItem.status,
+              countsForRun: false,
+              providerThreadId: scope.providerThreadId,
+              providerTurnId: scope.providerTurnId,
+              nativeItemRef: turnItem.nativeItemRef,
+              runtimeRequestId: null,
+              checkpointScopeId: null,
+              startedAt: turnItem.startedAt,
+              completedAt: turnItem.completedAt,
+            },
+          });
+        }
         yield* emit({ type: "turn_item.updated", driver: DRIVER, turnItem });
       });
 
-      const publishText = Effect.fnUntraced(function* (turn: ActiveTurn, key: string) {
-        const segment = turn.texts.get(key);
+      const publishText = Effect.fnUntraced(function* (scope: ItemScope, key: string) {
+        const segment = scope.texts.get(key);
         if (!segment) return;
         segment.emitted = true;
-        turn.dirty.delete(key);
+        scope.dirty.delete(key);
         const time = yield* DateTime.now;
-        const base = baseItem(turn, key, time, segment.streaming ? "running" : "completed");
+        const base = baseItem(scope, key, time, segment.streaming ? "running" : "completed");
         if (segment.kind === "reasoning") {
-          return yield* publishItem(turn, "reasoning", {
+          return yield* publishItem(scope, "reasoning", {
             ...base,
             type: "reasoning",
             text: segment.text,
@@ -534,12 +728,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         }
         const messageId = idAllocator.derive.messageFromProviderItem({
           driver: DRIVER,
-          nativeItemId: itemIdentity(turn, key),
+          nativeItemId: `${scope.identity}:${key}`,
         });
         const message: OrchestrationV2ConversationMessage = {
           id: messageId,
-          threadId: turn.input.threadId,
-          runId: turn.input.runId,
+          threadId: scope.threadId,
+          runId: scope.runId,
           nodeId: base.nodeId,
           role: "assistant",
           text: segment.text,
@@ -551,7 +745,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           updatedAt: time,
         };
         yield* emit({ type: "message.updated", driver: DRIVER, message });
-        yield* publishItem(turn, "assistant_message", {
+        yield* publishItem(scope, "assistant_message", {
           ...base,
           type: "assistant_message",
           messageId,
@@ -561,41 +755,41 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       });
       // The first chunk shows at once; later ones coalesce so a long reply stays linear.
       const appendText = Effect.fnUntraced(function* (
-        turn: ActiveTurn,
+        scope: ItemScope,
         key: string,
         kind: TextSegment["kind"],
         delta: string,
       ) {
-        const segment = turn.texts.get(key) ?? { kind, text: "", streaming: true, emitted: false };
-        turn.texts.set(key, segment);
+        const segment = scope.texts.get(key) ?? { kind, text: "", streaming: true, emitted: false };
+        scope.texts.set(key, segment);
         if (!segment.streaming || delta.length === 0) return;
         segment.text += delta;
-        if (!segment.emitted) return yield* publishText(turn, key);
-        turn.dirty.add(key);
-        if (turn.flushScheduled) return;
-        turn.flushScheduled = true;
+        if (!segment.emitted) return yield* publishText(scope, key);
+        scope.dirty.add(key);
+        if (scope.flushScheduled) return;
+        scope.flushScheduled = true;
         yield* Effect.sleep(TEXT_FLUSH_INTERVAL).pipe(
-          Effect.andThen(Queue.offer(inbox, { type: "flush", turn })),
-          Effect.forkIn(scope),
+          Effect.andThen(Queue.offer(inbox, { type: "flush", scope })),
+          Effect.forkIn(sessionScope),
         );
       });
       // The final event carries the whole text: it replaces the deltas instead of adding to them.
       const completeText = Effect.fnUntraced(function* (
-        turn: ActiveTurn,
+        scope: ItemScope,
         key: string,
         kind: TextSegment["kind"],
         text: string,
       ) {
-        const segment = turn.texts.get(key);
+        const segment = scope.texts.get(key);
         // A model response that only calls tools has no text worth a row.
         if (!segment && text.trim().length === 0) return;
-        turn.texts.set(key, {
+        scope.texts.set(key, {
           kind,
           text: text.length > 0 ? text : (segment?.text ?? ""),
           streaming: false,
           emitted: segment?.emitted ?? false,
         });
-        yield* publishText(turn, key);
+        yield* publishText(scope, key);
       });
 
       const toolTurnItem = (
@@ -701,7 +895,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         };
       };
       const publishTool = Effect.fnUntraced(function* (
-        turn: ActiveTurn,
+        scope: ItemScope,
         tool: ToolCall,
         terminal?: OrchestrationV2TurnItemStatus,
       ) {
@@ -734,16 +928,443 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         ) {
           // Taking the page also releases it when the call failed.
           const page = yield* mcpSessions.takeHtmlRender(
-            turn.input.threadId,
+            scope.mcpThreadId,
             record(tool.arguments) ?? {},
           );
           if (completion.success && page !== undefined) output = { htmlRender: page };
         }
         const time = yield* DateTime.now;
         yield* publishItem(
-          turn,
+          scope,
           "tool_call",
-          toolTurnItem(baseItem(turn, `tool:${tool.toolCallId}`, time, status), tool, output),
+          toolTurnItem(baseItem(scope, `tool:${tool.toolCallId}`, time, status), tool, output),
+        );
+      });
+      const settleScope = Effect.fnUntraced(function* (
+        scope: ItemScope,
+        status: OrchestrationV2TurnItemStatus,
+        subagents: ReadonlyMap<string, Subagent>,
+      ) {
+        for (const [key, segment] of scope.texts) {
+          if (!segment.streaming) continue;
+          segment.streaming = false;
+          if (segment.emitted || segment.text.length > 0) yield* publishText(scope, key);
+        }
+        for (const tool of scope.tools.values()) {
+          if (tool.completion === undefined && !subagents.has(tool.toolCallId)) {
+            yield* publishTool(scope, tool, status);
+          }
+        }
+      });
+
+      const publishSubagent = Effect.fnUntraced(function* (subagent: Subagent) {
+        const parent = subagent.parent;
+        const time = yield* DateTime.now;
+        const base = baseItem(parent, `tool:${subagent.toolCallId}`, time, subagent.status);
+        // A subagent always has its own node, even inside a child thread.
+        const nodeId = idAllocator.derive.nodeFromProviderItem({
+          driver: DRIVER,
+          nativeItemId: `${subagent.scope.identity}:subagent`,
+        });
+        const nativeTaskRef = nativeRef(subagent.toolCallId);
+        const subagentRecord: OrchestrationV2Subagent = {
+          id: nodeId,
+          threadId: parent.threadId,
+          runId: parent.runId,
+          parentNodeId: parent.rootNodeId,
+          origin: "provider_native",
+          createdBy: "agent",
+          driver: DRIVER,
+          providerInstanceId: options.instanceId,
+          providerThreadId: parent.providerThreadId,
+          childThreadId: subagent.scope.threadId,
+          nativeTaskRef,
+          prompt: subagent.prompt,
+          title: subagent.title,
+          model: subagent.model,
+          status: subagent.status,
+          result: subagent.result,
+          startedAt: base.startedAt,
+          completedAt: subagent.completedAt,
+          updatedAt: time,
+        };
+        const node = {
+          countsForRun: false,
+          nativeItemRef: nativeTaskRef,
+          runtimeRequestId: null,
+          checkpointScopeId: null,
+          status: subagent.status,
+          startedAt: base.startedAt,
+          completedAt: subagent.completedAt,
+        };
+        yield* emit({ type: "subagent.updated", driver: DRIVER, subagent: subagentRecord });
+        yield* emit({
+          type: "node.updated",
+          driver: DRIVER,
+          node: {
+            ...node,
+            id: nodeId,
+            threadId: parent.threadId,
+            runId: parent.runId,
+            parentNodeId: parent.rootNodeId,
+            rootNodeId: parent.rootNodeId,
+            kind: "subagent",
+            providerThreadId: parent.providerThreadId,
+            providerTurnId: parent.providerTurnId,
+          },
+        });
+        yield* emit({
+          type: "node.updated",
+          driver: DRIVER,
+          node: {
+            ...node,
+            id: subagent.scope.rootNodeId,
+            threadId: subagent.scope.threadId,
+            runId: null,
+            parentNodeId: null,
+            rootNodeId: subagent.scope.rootNodeId,
+            kind: "root_turn",
+            providerThreadId: null,
+            providerTurnId: null,
+          },
+        });
+        yield* emit({
+          type: "turn_item.updated",
+          driver: DRIVER,
+          turnItem: {
+            ...base,
+            nodeId,
+            nativeItemRef: nativeTaskRef,
+            completedAt: subagent.completedAt,
+            type: "subagent",
+            title: subagent.title,
+            subagentId: nodeId,
+            origin: "provider_native",
+            driver: DRIVER,
+            providerInstanceId: options.instanceId,
+            childThreadId: subagent.scope.threadId,
+            prompt: subagent.prompt,
+            result: subagent.result,
+          },
+        });
+      });
+      const startSubagent = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        parent: ItemScope,
+        tool: ToolCall,
+      ) {
+        const sessionId = session?.sessionId ?? "";
+        const prompt = stringField(tool.arguments, "prompt") ?? "";
+        const model = stringField(tool.arguments, "model") ?? null;
+        const time = yield* DateTime.now;
+        const identity = `${options.instanceId}:${sessionId}:task:${tool.toolCallId}`;
+        const childThreadId = idAllocator.derive.threadFromProviderThread({
+          driver: DRIVER,
+          providerInstanceId: options.instanceId,
+          nativeThreadId: `${sessionId}:task:${tool.toolCallId}`,
+        });
+        const rootNodeId = idAllocator.derive.nodeFromProviderItem({
+          driver: DRIVER,
+          nativeItemId: `${identity}:child-root`,
+        });
+        const title = subagentThreadTitle({
+          parentTitle: parent.appThread.title,
+          title: stringField(tool.arguments, "description") ?? null,
+          prompt,
+          ordinal: turn.subagents.size + 1,
+        });
+        const modelSelection =
+          model === null ? parent.modelSelection : { ...parent.modelSelection, model };
+        const appThread = makeSubagentChildThread({
+          parentThread: parent.appThread,
+          childThreadId,
+          parentNodeId: idAllocator.derive.nodeFromProviderItem({
+            driver: DRIVER,
+            nativeItemId: `${identity}:subagent`,
+          }),
+          activeProviderThreadId: null,
+          providerInstanceId: options.instanceId,
+          modelSelection,
+          title,
+          now: time,
+          createdBy: "agent",
+          creationSource: "provider",
+        });
+        const subagent: Subagent = {
+          toolCallId: tool.toolCallId,
+          parent,
+          // The prompt takes ordinal 100; the child's own items follow it.
+          scope: makeScope({
+            threadId: childThreadId,
+            runId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            rootNodeId,
+            sharesRootNode: true,
+            identity,
+            ordinalBase: 100,
+            appThread,
+            modelSelection,
+            mcpThreadId: parent.mcpThreadId,
+          }),
+          background: stringField(tool.arguments, "mode") === "background",
+          prompt,
+          title,
+          model,
+          status: "running",
+          result: null,
+          completedAt: null,
+        };
+        turn.subagents.set(tool.toolCallId, subagent);
+        yield* emit({ type: "app_thread.created", driver: DRIVER, appThread });
+        const promptItem = `${identity}:prompt`;
+        const artifacts = makeSubagentConversationArtifacts({
+          messageId: idAllocator.derive.messageFromProviderItem({
+            driver: DRIVER,
+            nativeItemId: promptItem,
+          }),
+          senderThreadId: parent.threadId,
+          turnItemId: idAllocator.derive.turnItemFromProviderItem({
+            driver: DRIVER,
+            nativeItemId: promptItem,
+          }),
+          threadId: childThreadId,
+          rootNodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: nativeRef(`${tool.toolCallId}:prompt`, "weak"),
+          role: "user",
+          text: prompt,
+          ordinal: 100,
+          now: time,
+        });
+        yield* emit({ type: "message.updated", driver: DRIVER, message: artifacts.message });
+        yield* emit({ type: "turn_item.updated", driver: DRIVER, turnItem: artifacts.turnItem });
+        yield* publishSubagent(subagent);
+      });
+      const settleSubagent = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        subagent: Subagent,
+        status: Exclude<SubagentStatus, "running">,
+        result?: string,
+      ) {
+        if (subagent.status !== "running") return;
+        yield* settleScope(subagent.scope, status, turn.subagents);
+        const lastAnswer = [...subagent.scope.texts.values()].findLast(
+          (segment) => segment.kind === "assistant_message",
+        )?.text;
+        subagent.status = status;
+        subagent.result = result?.trim() || lastAnswer || null;
+        subagent.completedAt = yield* DateTime.now;
+        yield* publishSubagent(subagent);
+      });
+
+      const publishPlan = Effect.fnUntraced(function* (turn: ActiveTurn, markdown: string) {
+        const planId =
+          turn.planId ??
+          (yield* idAllocator.allocate
+            .plan({ threadId: turn.input.threadId, runId: turn.input.runId, driver: DRIVER })
+            .pipe(Effect.mapError((cause) => protocolError("Cannot allocate a plan", cause))));
+        turn.planId = planId;
+        const base = baseItem(turn.scope, "proposed-plan", yield* DateTime.now, "completed");
+        yield* emit({
+          type: "plan.updated",
+          driver: DRIVER,
+          plan: {
+            id: planId,
+            threadId: turn.input.threadId,
+            runId: turn.input.runId,
+            nodeId: base.nodeId,
+            kind: "proposed_plan",
+            status: "active",
+            markdown,
+          },
+        });
+        yield* publishItem(turn.scope, "plan", {
+          ...base,
+          type: "proposed_plan",
+          planId,
+          markdown,
+          streaming: false,
+        });
+      });
+
+      const showRequest = Effect.fnUntraced(function* (entry: PendingRequest) {
+        yield* emit({
+          type: "runtime_request.updated",
+          driver: DRIVER,
+          threadId: entry.turn.input.threadId,
+          runtimeRequest: entry.request,
+        });
+        yield* emit({ type: "node.updated", driver: DRIVER, node: entry.node });
+        yield* emit({ type: "turn_item.updated", driver: DRIVER, turnItem: entry.item });
+      });
+      const openRequest = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        nativeRequestId: string,
+        native: PendingRequest["native"],
+        card:
+          | {
+              readonly type: "approval";
+              readonly kind: ProviderRequestKind;
+              readonly prompt: string;
+              readonly options: ReadonlyArray<ProviderApprovalOption>;
+            }
+          | { readonly type: "question"; readonly request: UserInputRequest },
+      ) {
+        const requestId = yield* idAllocator.allocate
+          .runtimeRequest({
+            driver: DRIVER,
+            providerTurnId: turn.providerTurn.id,
+            nativeRequestId,
+          })
+          .pipe(Effect.mapError((cause) => protocolError("Cannot allocate a request", cause)));
+        const time = yield* DateTime.now;
+        const nodeId = idAllocator.derive.approvalNode({ requestId });
+        const request: OrchestrationV2RuntimeRequest = {
+          id: requestId,
+          nodeId,
+          providerTurnId: turn.providerTurn.id,
+          nativeRequestRef: nativeRef(
+            nativeRequestId,
+            native.type === "question" ? "weak" : "strong",
+          ),
+          kind: card.type === "approval" ? card.kind : "user_input",
+          status: "pending",
+          responseCapability: { type: "live", providerSessionId: input.providerSessionId },
+          createdAt: time,
+          resolvedAt: null,
+        };
+        const base = {
+          ...baseItem(turn.scope, `request:${nativeRequestId}`, time, "waiting"),
+          id: idAllocator.derive.approvalTurnItem({ requestId }),
+          nodeId,
+          nativeItemRef: request.nativeRequestRef,
+        };
+        const choices = card.type === "question" ? (card.request.choices ?? []) : [];
+        const entry: PendingRequest = {
+          turn,
+          native,
+          request,
+          node: {
+            id: nodeId,
+            threadId: turn.input.threadId,
+            runId: turn.input.runId,
+            parentNodeId: turn.input.rootNodeId,
+            rootNodeId: turn.input.rootNodeId,
+            kind: card.type === "approval" ? "approval_request" : "user_input_request",
+            status: "waiting",
+            countsForRun: false,
+            providerThreadId: turn.input.providerThread.id,
+            providerTurnId: turn.providerTurn.id,
+            nativeItemRef: request.nativeRequestRef,
+            runtimeRequestId: requestId,
+            checkpointScopeId: null,
+            startedAt: time,
+            completedAt: null,
+          },
+          item:
+            card.type === "approval"
+              ? {
+                  ...base,
+                  type: "approval_request",
+                  requestId,
+                  requestKind: card.kind,
+                  prompt: card.prompt,
+                  options: card.options,
+                }
+              : {
+                  ...base,
+                  type: "user_input_request",
+                  requestId,
+                  questions: [
+                    {
+                      id: QUESTION_ID,
+                      header: "Question",
+                      question: card.request.question.trim() || "Copilot has a question",
+                      options: choices
+                        .filter((choice) => choice.trim().length > 0)
+                        .map((choice) => ({ label: choice.trim(), description: choice.trim() })),
+                      multiSelect: false,
+                      allowCustomAnswer:
+                        card.request.allowFreeform !== false || choices.length === 0,
+                      required: true,
+                    },
+                  ],
+                },
+        };
+        pending.set(requestId, entry);
+        if (native.type === "permission") pendingPermissions.set(native.requestId, requestId);
+        yield* showRequest(entry);
+        yield* updateSession("waiting");
+      });
+      const closeRequest = Effect.fnUntraced(function* (
+        entry: PendingRequest,
+        status: "resolved" | "cancelled",
+        response?: Pick<OrchestrationV2RuntimeRequest, "decision" | "answers" | "feedback">,
+      ) {
+        if (pending.get(entry.request.id) !== entry) return;
+        pending.delete(entry.request.id);
+        if (entry.native.type === "permission") pendingPermissions.delete(entry.native.requestId);
+        const time = yield* DateTime.now;
+        const itemStatus = status === "resolved" ? "completed" : "cancelled";
+        entry.request = {
+          ...entry.request,
+          ...response,
+          status,
+          resolvedAt: time,
+          responseCapability: { type: "not_resumable", reason: "This Copilot request has ended." },
+        };
+        entry.node = { ...entry.node, status: itemStatus, completedAt: time };
+        entry.item = { ...entry.item, status: itemStatus, completedAt: time, updatedAt: time };
+        yield* showRequest(entry);
+        if (active === entry.turn && pending.size === 0) yield* updateSession("running");
+      });
+      const requestPermission = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        data: SessionEventPayload<"permission.requested">["data"],
+      ) {
+        if (data.resolvedByHook === true || pendingPermissions.has(data.requestId)) return;
+        const target = session;
+        if (!target) return;
+        const request = data.permissionRequest;
+        const policy = turn.input.runtimePolicy;
+        // Copilot can clear the managed marker only on prompt kinds that carry it.
+        const prompted = data.promptRequest;
+        const needsHuman =
+          (prompted !== undefined && "managedApprovalRequired" in prompted
+            ? prompted.managedApprovalRequired
+            : request.managedApprovalRequired) === true;
+        const automatic =
+          !needsHuman &&
+          (currentSettings.allowAll ||
+            request.kind === "read" ||
+            (policy.runtimeMode === "auto-accept-edits" && request.kind === "write"));
+        if (automatic) {
+          return yield* Effect.tryPromise(() =>
+            target.rpc.permissions.handlePendingPermissionRequest({
+              requestId: data.requestId,
+              result: { kind: "approve-once" },
+            }),
+          ).pipe(Effect.ignore);
+        }
+        const presentation = permissionPresentation(request);
+        yield* openRequest(
+          turn,
+          data.requestId,
+          { type: "permission", requestId: data.requestId, forSession: presentation.forSession },
+          {
+            type: "approval",
+            kind: presentation.kind,
+            prompt: presentation.prompt,
+            options: [
+              { decision: "accept", label: "Allow once" },
+              ...(presentation.forSession === undefined
+                ? []
+                : [{ decision: "acceptForSession" as const, label: "Allow for this session" }]),
+              { decision: "decline", label: "Deny" },
+            ],
+          },
         );
       });
 
@@ -754,22 +1375,37 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         disposition: "reusable" | "broken" = "reusable",
       ) {
         if (active !== turn) return;
-        for (const [key, segment] of turn.texts) {
-          if (!segment.streaming) continue;
-          segment.streaming = false;
-          if (segment.emitted || segment.text.length > 0) yield* publishText(turn, key);
+        // session.idle waits for background agents, so a still-running one did not finish.
+        for (const subagent of turn.subagents.values()) {
+          yield* settleSubagent(turn, subagent, status === "completed" ? "interrupted" : status);
         }
-        for (const tool of turn.tools.values()) {
-          if (tool.completion === undefined) yield* publishTool(turn, tool, status);
+        yield* settleScope(turn.scope, status, turn.subagents);
+        for (const entry of pending.values()) {
+          if (entry.turn !== turn) continue;
+          if (entry.native.type === "question") {
+            entry.native.reject(new Error("The T3 Code turn ended before the user answered."));
+          }
+          yield* closeRequest(entry, "cancelled");
         }
         const completedAt = yield* DateTime.now;
-        turn.providerTurn = { ...turn.providerTurn, status, completedAt };
-        yield* emit({
-          type: "provider_turn.updated",
-          driver: DRIVER,
-          threadId: turn.input.threadId,
-          providerTurn: turn.providerTurn,
-        });
+        const usage = turn.providerTurn.turnTokenUsage;
+        turn.providerTurn = {
+          ...turn.providerTurn,
+          status,
+          completedAt,
+          ...(usage?.inputTokens === undefined || usage.outputTokens === undefined
+            ? {}
+            : {
+                turnTokenUsage: {
+                  ...usage,
+                  hasSubagents: turn.subagents.size > 0,
+                  usageStatus: "complete",
+                  inputTokens: usage.inputTokens,
+                  outputTokens: usage.outputTokens,
+                },
+              }),
+        };
+        yield* emitTurn(turn);
         yield* updateThread({ status: disposition === "broken" ? "error" : "idle" });
         yield* updateSession(
           disposition === "broken" ? "error" : "ready",
@@ -782,7 +1418,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             message: detail ?? "Copilot could not finish the turn.",
             ...(turn.lastError?.errorCode === undefined ? {} : { code: turn.lastError.errorCode }),
           });
-          const base = baseItem(turn, "failure", completedAt, "failed");
+          const base = baseItem(turn.scope, "failure", completedAt, "failed");
           yield* emit({
             type: "turn_item.updated",
             driver: DRIVER,
@@ -815,35 +1451,36 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       });
 
       // Projection runs per SDK event inside the session's span; a span per event is noise.
-      const handleEvent = Effect.fnUntraced(function* (event: SessionEvent) {
-        const turn = active;
-        // A child agent's events never drive the root turn.
-        if (!turn || event.agentId !== undefined) return;
+      const projectContent = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        scope: ItemScope,
+        event: SessionEvent,
+      ) {
         switch (event.type) {
           case "assistant.message_delta":
             return yield* appendText(
-              turn,
+              scope,
               `message:${event.data.messageId}`,
               "assistant_message",
               event.data.deltaContent,
             );
           case "assistant.message":
             return yield* completeText(
-              turn,
+              scope,
               `message:${event.data.messageId}`,
               "assistant_message",
               event.data.content,
             );
           case "assistant.reasoning_delta":
             return yield* appendText(
-              turn,
+              scope,
               `reasoning:${event.data.reasoningId}`,
               "reasoning",
               event.data.deltaContent,
             );
           case "assistant.reasoning":
             return yield* completeText(
-              turn,
+              scope,
               `reasoning:${event.data.reasoningId}`,
               "reasoning",
               event.data.content,
@@ -858,23 +1495,26 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               mcpToolName: event.data.mcpToolName,
               displayCommand: event.data.shellToolInfo?.displayCommand,
             };
-            turn.tools.set(tool.toolCallId, tool);
-            return yield* publishTool(turn, tool);
+            scope.tools.set(tool.toolCallId, tool);
+            if (tool.toolName === SUBAGENT_TOOL && tool.mcpServerName === undefined) {
+              return yield* startSubagent(turn, scope, tool);
+            }
+            return yield* publishTool(scope, tool);
           }
           case "tool.shell_output": {
-            const tool = turn.tools.get(event.data.toolCallId);
+            const tool = scope.tools.get(event.data.toolCallId);
             if (!tool || tool.completion !== undefined) return;
             const time = yield* DateTime.now;
             return yield* emit({
               type: "command_output.delta",
               driver: DRIVER,
-              threadId: turn.input.threadId,
-              itemId: baseItem(turn, `tool:${tool.toolCallId}`, time, "running").id,
+              threadId: scope.threadId,
+              itemId: baseItem(scope, `tool:${tool.toolCallId}`, time, "running").id,
               chunk: event.data.text,
             });
           }
           case "tool.execution_complete": {
-            const tool: ToolCall = turn.tools.get(event.data.toolCallId) ?? {
+            const tool: ToolCall = scope.tools.get(event.data.toolCallId) ?? {
               toolCallId: event.data.toolCallId,
               toolName: event.data.toolDescription?.name ?? "tool",
               title: undefined,
@@ -884,13 +1524,159 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               displayCommand: undefined,
             };
             tool.completion = event.data;
-            turn.tools.set(tool.toolCallId, tool);
-            return yield* publishTool(turn, tool);
+            scope.tools.set(tool.toolCallId, tool);
+            const subagent = turn.subagents.get(tool.toolCallId);
+            if (subagent === undefined) return yield* publishTool(scope, tool);
+            // A background task's call settles at launch; subagent.completed ends it.
+            if (!event.data.success) {
+              return yield* settleSubagent(turn, subagent, "failed", event.data.error?.message);
+            }
+            if (!subagent.background) {
+              return yield* settleSubagent(turn, subagent, "completed", event.data.result?.content);
+            }
+            return;
+          }
+        }
+      });
+      const handleEvent = Effect.fnUntraced(function* (event: SessionEvent) {
+        const turn = active;
+        if (!turn) return;
+        const root = event.agentId === undefined;
+        switch (event.type) {
+          case "subagent.started": {
+            const subagent = turn.subagents.get(event.data.toolCallId);
+            if (!subagent) return;
+            if (event.agentId !== undefined) turn.agents.set(event.agentId, subagent);
+            subagent.model = event.data.model ?? subagent.model;
+            return yield* publishSubagent(subagent);
+          }
+          case "subagent.completed": {
+            const subagent = turn.subagents.get(event.data.toolCallId);
+            if (!subagent) return;
+            return yield* settleSubagent(
+              turn,
+              subagent,
+              event.data.cancelled === true ? "cancelled" : "completed",
+            );
+          }
+          case "subagent.failed": {
+            const subagent = turn.subagents.get(event.data.toolCallId);
+            if (!subagent) return;
+            return yield* settleSubagent(turn, subagent, "failed", event.data.error);
+          }
+          // Requests from subagents surface on the root turn, where the user answers them.
+          case "permission.requested":
+            return yield* requestPermission(turn, event.data);
+          case "permission.completed": {
+            const requestId = pendingPermissions.get(event.data.requestId);
+            const entry = requestId === undefined ? undefined : pending.get(requestId);
+            return entry === undefined ? undefined : yield* closeRequest(entry, "resolved");
+          }
+          case "assistant.usage": {
+            // Turn usage is the main agent's; a child's calls are its own.
+            if (!root || event.data.parentToolCallId !== undefined) return;
+            const accounting = event.data.accounting;
+            const usageId =
+              accounting === undefined
+                ? event.id
+                : `${accounting.sourceSessionId}:${accounting.usageId}`;
+            if (turn.usageIds.has(usageId)) return;
+            turn.usageIds.add(usageId);
+            const previous = turn.providerTurn.turnTokenUsage;
+            const add = (total: number | undefined, value: number | undefined) =>
+              total === undefined && value === undefined ? undefined : (total ?? 0) + (value ?? 0);
+            const cacheCreationTokens = add(
+              previous?.cacheCreationTokens,
+              event.data.cacheWriteTokens,
+            );
+            turn.providerTurn = {
+              ...turn.providerTurn,
+              turnTokenUsage: {
+                usageScope: "main_agent",
+                usageStatus: "partial",
+                hasSubagents: turn.subagents.size > 0,
+                inputTokens: add(previous?.inputTokens, event.data.inputTokens) ?? 0,
+                outputTokens: add(previous?.outputTokens, event.data.outputTokens) ?? 0,
+                cachedInputTokens:
+                  add(previous?.cachedInputTokens, event.data.cacheReadTokens) ?? 0,
+                reasoningTokens: add(previous?.reasoningTokens, event.data.reasoningTokens) ?? 0,
+                ...(cacheCreationTokens === undefined ? {} : { cacheCreationTokens }),
+              },
+            };
+            return yield* emitTurn(turn);
+          }
+          case "session.usage_info": {
+            if (!root) return;
+            const updatedAt = DateTime.formatIso(yield* DateTime.now);
+            yield* updateThread({
+              contextUsage: {
+                usedTokens: event.data.currentTokens,
+                ...(event.data.tokenLimit > 0 ? { maxTokens: event.data.tokenLimit } : {}),
+              },
+            });
+            turn.providerTurn = {
+              ...turn.providerTurn,
+              tokenUsage: {
+                ...turn.providerTurn.tokenUsage,
+                usedTokens: event.data.currentTokens,
+                maxTokens: event.data.tokenLimit,
+                updatedAt,
+              },
+            };
+            return yield* emitTurn(turn);
+          }
+          case "session.compaction_start": {
+            if (!root) return;
+            turn.compaction = `compaction:${event.data.compactionAttemptId ?? turn.scope.ordinals.size}`;
+            return yield* publishItem(turn.scope, "system", {
+              ...baseItem(turn.scope, turn.compaction, yield* DateTime.now, "running"),
+              type: "compaction",
+              driver: DRIVER,
+              ...(event.data.currentTokens === undefined
+                ? {}
+                : { beforeTokenCount: event.data.currentTokens }),
+            });
+          }
+          case "session.compaction_complete": {
+            if (!root) return;
+            const key =
+              event.data.compactionAttemptId === undefined
+                ? (turn.compaction ?? `compaction:${turn.scope.ordinals.size}`)
+                : `compaction:${event.data.compactionAttemptId}`;
+            turn.compaction = undefined;
+            const summary = event.data.summaryContent?.trim();
+            return yield* publishItem(turn.scope, "system", {
+              ...baseItem(
+                turn.scope,
+                key,
+                yield* DateTime.now,
+                event.data.success ? "completed" : "failed",
+              ),
+              type: "compaction",
+              driver: DRIVER,
+              ...(summary ? { summary } : {}),
+              ...(event.data.preCompactionTokens === undefined
+                ? {}
+                : { beforeTokenCount: event.data.preCompactionTokens }),
+              ...(event.data.postCompactionTokens === undefined
+                ? {}
+                : { afterTokenCount: event.data.postCompactionTokens }),
+            });
           }
           case "session.error":
-            turn.lastError = event.data;
+            if (root) turn.lastError = event.data;
             return;
         }
+        const agentId = event.agentId;
+        if (agentId === undefined) return yield* projectContent(turn, turn.scope, event);
+        // Copilot tags a child's events with its agentId; older events also name the task call.
+        const parentToolCallId = stringField(event.data, "parentToolCallId");
+        const subagent =
+          turn.agents.get(agentId) ??
+          (parentToolCallId === undefined ? undefined : turn.subagents.get(parentToolCallId));
+        if (!subagent) return;
+        turn.agents.set(agentId, subagent);
+        yield* projectContent(turn, subagent.scope, event);
       });
       const settle = Effect.fnUntraced(function* (
         turn: ActiveTurn,
@@ -908,21 +1694,49 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       });
       const handleInbox = Effect.fnUntraced(
         function* (entry: Inbox) {
-          if (entry.type === "event") {
-            if (entry.epoch === sessionEpoch) yield* handleEvent(entry.event);
-            return;
+          switch (entry.type) {
+            case "event":
+              if (entry.epoch === sessionEpoch) yield* handleEvent(entry.event);
+              return;
+            case "flush":
+              entry.scope.flushScheduled = false;
+              for (const key of entry.scope.dirty) yield* publishText(entry.scope, key);
+              return;
+            case "settled":
+              if (active === entry.turn) yield* settle(entry.turn, entry.exit);
+              return;
+            case "plan":
+              if (active) yield* publishPlan(active, entry.markdown);
+              return;
+            case "question": {
+              const turn = active;
+              if (!turn) {
+                return entry.reject(new Error("Copilot asked a question outside a T3 Code turn."));
+              }
+              const nativeId = `ask_user:${++questionCount}`;
+              return yield* openRequest(
+                turn,
+                nativeId,
+                {
+                  type: "question",
+                  request: entry.request,
+                  resolve: entry.resolve,
+                  reject: entry.reject,
+                },
+                { type: "question", request: entry.request },
+              );
+            }
           }
-          if (active !== entry.turn) return;
-          if (entry.type === "settled") return yield* settle(entry.turn, entry.exit);
-          entry.turn.flushScheduled = false;
-          for (const key of entry.turn.dirty) yield* publishText(entry.turn, key);
         },
         Effect.catchCause((cause) =>
           Effect.logWarning("Could not project a Copilot SDK event", cause),
         ),
         eventPermit.withPermits(1),
       );
-      yield* Stream.fromQueue(inbox).pipe(Stream.runForEach(handleInbox), Effect.forkIn(scope));
+      yield* Stream.fromQueue(inbox).pipe(
+        Stream.runForEach(handleInbox),
+        Effect.forkIn(sessionScope),
+      );
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
           closed = true;
@@ -933,19 +1747,20 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         }).pipe(eventPermit.withPermits(1)),
       );
 
-      const onPermissionRequest: PermissionHandler = (request) => {
-        const policy = active?.input.runtimePolicy ?? input.runtimePolicy;
-        if (request.managedApprovalRequired !== true) {
-          if (currentSettings.allowAll || request.kind === "read") return { kind: "approve-once" };
-          if (policy.runtimeMode === "auto-accept-edits" && request.kind === "write") {
-            return { kind: "approve-once" };
-          }
-        }
-        return {
-          kind: "reject",
-          feedback:
-            "T3 Code cannot show Copilot approval prompts yet, so this action was declined. If it is needed, ask the user to give this thread full access or turn on Allow all.",
-        };
+      // The SDK hands this handler no request id, so the question gets a local one.
+      const onUserInputRequest: UserInputHandler = (request) =>
+        new Promise((resolve, reject) => {
+          Queue.offerUnsafe(inbox, { type: "question", request, resolve, reject });
+        });
+      // T3 owns the plan review; Copilot is told to stop, as Claude is for ExitPlanMode.
+      const onExitPlanModeRequest: NonNullable<SessionConfig["onExitPlanModeRequest"]> = (
+        request,
+      ) => {
+        Queue.offerUnsafe(inbox, {
+          type: "plan",
+          markdown: request.planContent?.trim() || request.summary,
+        });
+        return { approved: false, feedback: PLAN_CAPTURED_FEEDBACK };
       };
       const systemMessage = (
         mcp: McpProviderSession.McpProviderSessionConfig | undefined,
@@ -996,6 +1811,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         const mcp = yield* mcpSessions.read(args.threadId);
         const settings = copilotSessionSettings(args.modelSelection, args.runtimePolicy);
         const epoch = ++sessionEpoch;
+        // Without onPermissionRequest Copilot leaves requests pending as events with their ids.
         const config = {
           clientName: "t3-code",
           model: settings.model,
@@ -1017,7 +1833,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                   },
                 },
               }),
-          onPermissionRequest,
+          onUserInputRequest,
+          onExitPlanModeRequest,
           onEvent: (event: SessionEvent) => {
             Queue.offerUnsafe(inbox, { type: "event", epoch, event });
           },
@@ -1160,13 +1977,14 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         );
         const nativeTurnId = `${target.sessionId}:${turnInput.attemptId}`;
         const startedAt = yield* DateTime.now;
+        const providerTurnId = idAllocator.derive.providerTurn({
+          driver: DRIVER,
+          nativeTurnId: `${options.instanceId}:${nativeTurnId}`,
+        });
         const turn: ActiveTurn = {
           input: turnInput,
           providerTurn: {
-            id: idAllocator.derive.providerTurn({
-              driver: DRIVER,
-              nativeTurnId: `${options.instanceId}:${nativeTurnId}`,
-            }),
+            id: providerTurnId,
             providerThreadId: turnInput.providerThread.id,
             nodeId: turnInput.rootNodeId,
             runAttemptId: turnInput.attemptId,
@@ -1177,25 +1995,32 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             completedAt: null,
           },
           nativeTurnId,
-          ordinals: new Map(),
-          startedAt: new Map(),
-          texts: new Map(),
-          tools: new Map(),
-          dirty: new Set(),
+          scope: makeScope({
+            threadId: turnInput.threadId,
+            runId: turnInput.runId,
+            providerThreadId: turnInput.providerThread.id,
+            providerTurnId,
+            rootNodeId: turnInput.rootNodeId,
+            sharesRootNode: false,
+            identity: `${options.instanceId}:${turnInput.providerThread.id}:${nativeTurnId}`,
+            ordinalBase: turnInput.providerTurnOrdinal * 100,
+            appThread: turnInput.appThread,
+            modelSelection: turnInput.modelSelection,
+            mcpThreadId: turnInput.threadId,
+          }),
+          subagents: new Map(),
+          agents: new Map(),
+          usageIds: new Set(),
           done: yield* Deferred.make<void>(),
-          flushScheduled: false,
+          planId: undefined,
+          compaction: undefined,
           interruptRequested: false,
           lastError: undefined,
         };
         yield* Effect.gen(function* () {
           thread = turnInput.providerThread;
           active = turn;
-          yield* emit({
-            type: "provider_turn.updated",
-            driver: DRIVER,
-            threadId: turnInput.threadId,
-            providerTurn: turn.providerTurn,
-          });
+          yield* emitTurn(turn);
           yield* updateThread({
             status: "active",
             firstRunOrdinal: thread.firstRunOrdinal ?? turnInput.runOrdinal,
@@ -1203,16 +2028,56 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           });
           yield* updateSession("running");
         }).pipe(eventPermit.withPermits(1));
-        // sendAndWait correlates completion with this request, waits out autopilot and rejects
-        // when the CLI exits. Its outcome queues behind the events that preceded it.
+        // sendAndWait correlates completion with this request, waits out autopilot and background
+        // agents, and rejects when the CLI exits. Its outcome queues behind the preceding events.
         yield* Effect.tryPromise({
           try: () => target.sendAndWait(message, TURN_COMPLETION_TIMEOUT_MS),
           catch: (cause) => protocolError("Copilot could not finish the turn", cause),
         }).pipe(
           Effect.exit,
           Effect.flatMap((exit) => Queue.offer(inbox, { type: "settled", turn, exit })),
-          Effect.forkIn(scope),
+          Effect.forkIn(sessionScope),
         );
+      });
+
+      const answer = Effect.fn("CopilotSdkAdapter.respondToRuntimeRequest")(function* (
+        args: ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput,
+      ) {
+        const entry = pending.get(args.requestId);
+        const target = session;
+        if (!entry || !target) return yield* protocolError("This Copilot request is not pending");
+        if (entry.native.type === "question") {
+          const raw = args.answers?.[QUESTION_ID];
+          const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw[0] : undefined;
+          if (typeof text !== "string" || text.trim().length === 0) {
+            return yield* protocolError("Copilot needs a non-empty answer");
+          }
+          entry.native.resolve({
+            answer: text,
+            wasFreeform: !(entry.native.request.choices ?? []).includes(text),
+          });
+          return yield* closeRequest(entry, "resolved", { answers: { [QUESTION_ID]: text } }).pipe(
+            eventPermit.withPermits(1),
+          );
+        }
+        const decision = args.decision ?? "decline";
+        const result: PermissionDecision =
+          decision === "accept"
+            ? { kind: "approve-once" }
+            : decision === "acceptForSession" || decision === "acceptAlways"
+              ? (entry.native.forSession ?? { kind: "approve-once" })
+              : {
+                  kind: "reject",
+                  ...(args.feedback?.trim() ? { feedback: args.feedback.trim() } : {}),
+                };
+        const requestId = entry.native.requestId;
+        yield* call("permission response", () =>
+          target.rpc.permissions.handlePendingPermissionRequest({ requestId, result }),
+        );
+        yield* closeRequest(entry, "resolved", {
+          decision,
+          ...(args.feedback?.trim() ? { feedback: args.feedback.trim() } : {}),
+        }).pipe(eventPermit.withPermits(1));
       });
 
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
@@ -1221,6 +2086,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         providerSessionId: input.providerSessionId,
         providerSession,
         events: Stream.fromQueue(events),
+        // Copilot's background agents run inside its process and end with it.
+        backgroundTasksEndWithProcess: true,
         ensureThread: (args) =>
           register(args).pipe(
             commands.withPermits(1),
@@ -1334,12 +2201,15 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             ),
         ),
         respondToRuntimeRequest: (args) =>
-          Effect.fail(
-            new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
-              driver: DRIVER,
-              requestId: args.requestId,
-              cause: "This Copilot session has no pending requests.",
-            }),
+          answer(args).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
+                  driver: DRIVER,
+                  requestId: args.requestId,
+                  cause,
+                }),
+            ),
           ),
         readThreadSnapshot: (args) =>
           Effect.fail(
