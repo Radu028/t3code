@@ -1288,7 +1288,8 @@ describe("CopilotSdkAdapterV2", () => {
       });
 
       // Copilot answers a finished background task with a root run of its own. waitForPending
-      // can return while that run works and no task is listed; the turn ends once it idles.
+      // can return while that run works and no task is listed; the turn ends once Copilot stops
+      // that run.
       yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
       fake.setRunningTasks(0);
       const releaseFollowUpWait = fake.holdDrain();
@@ -1322,9 +1323,9 @@ describe("CopilotSdkAdapterV2", () => {
       });
       yield* fake.emit({
         ...event,
-        type: "session.idle",
+        type: "session.autopilot_stopped",
         ephemeral: true,
-        data: { mode: "autopilot" },
+        data: { reason: "completed", requestId: "follow-up" },
       });
       const followed = yield* harness.untilTerminal();
       assert.isTrue(

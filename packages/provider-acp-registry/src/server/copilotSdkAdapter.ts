@@ -2058,18 +2058,18 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             return;
           case "assistant.turn_start":
             // After the request settled, a root run is Copilot's own follow-up, such as one
-            // answering a finished background task.
+            // answering a finished background task. It ends as a steer's run does.
             if (root && turn.requestSettled && event.data.parentToolCallId === undefined) {
               turn.followUpRunning = true;
             }
             return;
           case "session.idle":
-            // Autopilot idles between continuations of the request; after it settled, an idle
-            // ends a follow-up run.
-            if (!root || (event.data.mode === "autopilot" && !turn.requestSettled)) return;
+            // Autopilot idles between continuations; autopilot_stopped ends its runs, as the
+            // SDK's own sendAndWait decides.
+            if (!root || event.data.mode === "autopilot") return;
             turn.followUpRunning = false;
             if (turn.requestSettled && event.data.aborted === true) {
-              return yield* release(turn, turn.interruptRequested ? "interrupted" : "cancelled");
+              return yield* finish(turn, turn.interruptRequested ? "interrupted" : "cancelled");
             }
             return yield* complete(turn);
           case "session.autopilot_stopped":
