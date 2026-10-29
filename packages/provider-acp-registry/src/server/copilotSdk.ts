@@ -46,6 +46,8 @@ export interface CopilotProcess {
   readonly hasExited: () => boolean;
   /** Resolves after the exit and after the SDK dispatched every notification it had read. */
   readonly exited: Promise<void>;
+  /** SIGKILLs the process directly, for when the SDK no longer tracks it. */
+  readonly kill: () => void;
 }
 
 // A grandchild holding an inherited pipe can keep stdio open long after the exit.
@@ -77,6 +79,7 @@ export function copilotClientProcess(client: object): CopilotProcess | undefined
   return {
     id: child.pid,
     hasExited,
+    kill: () => void child.kill("SIGKILL"),
     exited: stdioClosed
       .then(() => (typeof drain === "function" ? Reflect.apply(drain, connection, []) : undefined))
       .then(

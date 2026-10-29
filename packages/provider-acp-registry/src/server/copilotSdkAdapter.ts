@@ -647,6 +647,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           Effect.map(Option.isSome),
           Effect.orElseSucceed(() => false),
         );
+        // After a failed stop() the SDK forgets its child, so forceStop() no longer kills it.
+        if (target.process !== undefined && !target.process.hasExited()) target.process.kill();
         const failure = stopped
           ? treeFailure
           : treeFailure === undefined
@@ -688,11 +690,27 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             );
       yield* observeExit(client);
       yield* Effect.addFinalizer(() =>
-        Effect.tryPromise(() => client.stop()).pipe(
-          Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
-          Effect.flatMap((stopped) => (Option.isNone(stopped) ? terminate(client) : Effect.void)),
-          Effect.ignore,
-        ),
+        Effect.gen(function* () {
+          const target = client;
+          // stop() reports a CLI it could not kill among its errors rather than rejecting.
+          const stopped = yield* Effect.tryPromise(() => target.stop()).pipe(
+            Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
+            Effect.map((errors) => Option.isSome(errors) && errors.value.length === 0),
+            Effect.orElseSucceed(() => false),
+          );
+          if (stopped) return;
+          const failure = yield* terminate(target);
+          const cli = target.process;
+          if (cli !== undefined && !cli.hasExited()) {
+            yield* Effect.promise(() => cli.exited).pipe(Effect.timeoutOption(CLIENT_STOP_TIMEOUT));
+          }
+          if (failure !== undefined || cli?.hasExited() === false) {
+            yield* Effect.logWarning("Copilot may still be running after its session closed", {
+              pid: cli?.id,
+              failure,
+            });
+          }
+        }),
       );
       const commands = yield* Semaphore.make(1);
       const eventPermit = yield* Semaphore.make(1);
@@ -1619,6 +1637,17 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         }).pipe(eventPermit.withPermits(1));
       });
 
+      /** Whether Copilot lists a running task; undefined when it cannot say in time. */
+      const listsRunningTasks = (target: CopilotSdkSession) =>
+        Effect.tryPromise(() => target.rpc.tasks.list()).pipe(
+          Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
+          Effect.map((listed) =>
+            Option.isSome(listed)
+              ? listed.value.tasks.some((task) => task.status === "running")
+              : undefined,
+          ),
+          Effect.orElseSucceed(() => undefined),
+        );
       /**
        * Ends a turn that did not complete. Autopilot shells and background agents outlive the
        * request, so T3 takes the thread back only once Copilot lists none running; otherwise it
@@ -1635,14 +1664,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         }
         if (turn.ending !== undefined) return;
         turn.ending = { status, ...(detail === undefined ? {} : { detail }) };
-        yield* Effect.tryPromise(() => target.rpc.tasks.list()).pipe(
-          Effect.timeoutOption(CLIENT_STOP_TIMEOUT),
-          Effect.map((listed) =>
-            Option.isSome(listed)
-              ? listed.value.tasks.some((task) => task.status === "running")
-              : undefined,
-          ),
-          Effect.orElseSucceed(() => undefined),
+        turn.tasksChanged = false;
+        yield* listsRunningTasks(target).pipe(
           Effect.flatMap((busy) => Queue.offer(inbox, { type: "drained", turn, busy })),
           Effect.forkIn(sessionScope),
         );
@@ -1904,7 +1927,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           }
           case "session.background_tasks_changed":
             if (!root) return;
-            if (turn.draining) turn.tasksChanged = true;
+            if (turn.draining || turn.ending !== undefined) turn.tasksChanged = true;
             if (!turn.drainWaiting) return;
             turn.drainWaiting = false;
             return yield* complete(turn);
@@ -1966,12 +1989,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           Effect.catchCause((cause) =>
             Effect.logWarning("Could not wait for Copilot's background work", cause),
           ),
-          Effect.andThen(
-            Effect.tryPromise(() => target.rpc.tasks.list()).pipe(
-              Effect.map(({ tasks }) => tasks.some((task) => task.status === "running")),
-              Effect.orElseSucceed(() => undefined),
-            ),
-          ),
+          Effect.andThen(listsRunningTasks(target)),
           Effect.flatMap((busy) => Queue.offer(inbox, { type: "drained", turn, busy })),
           Effect.forkIn(sessionScope),
         );
@@ -2014,7 +2032,13 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               if (active !== turn || turn.forcedStop) return;
               const ending = turn.ending;
               if (ending !== undefined) {
-                if (entry.busy === false) return yield* finish(turn, ending.status, ending.detail);
+                // A steer's run or a task that started after the list may still be working.
+                const quiet =
+                  entry.busy === false &&
+                  turn.steers.size === 0 &&
+                  !turn.followUpRunning &&
+                  !turn.tasksChanged;
+                if (quiet) return yield* finish(turn, ending.status, ending.detail);
                 // Forked: the kill path waits for this event permit.
                 return yield* killTurn(turn, ending.status, ending.detail).pipe(
                   Effect.forkIn(sessionScope),

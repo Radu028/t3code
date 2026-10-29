@@ -27,10 +27,12 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Sink from "effect/Sink";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -103,6 +105,11 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   let created = 0;
   let hangAbort = false;
   let stopFails = false;
+  let stopErrors: Array<Error> = [];
+  // After a stop() that reported errors the SDK no longer tracks its child.
+  let childForgotten = false;
+  // Each held list answers one tasks.list call, in order.
+  const listGates: Array<Promise<void>> = [];
   let sendGate: Promise<void> | undefined;
   let exitGate: Promise<void> | undefined;
   // Each held drain gates one waitForPending call, in order.
@@ -181,6 +188,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         },
         list: async () => {
           record("tasks.list");
+          await listGates.shift();
           if (failedLists > 0) {
             failedLists -= 1;
             throw new Error("tasks.list failed");
@@ -199,9 +207,12 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
     },
   });
   let exitProcess: () => void = () => {};
+  let hasExitedNow: () => boolean = () => false;
   // Each launch is its own process, as relaunching the SDK client is.
   const makeClient = (): CopilotSdkClient => {
     let hasExited = false;
+    hasExitedNow = () => hasExited;
+    childForgotten = false;
     const exited = new Promise<void>((resolve) => {
       exitProcess = () => {
         hasExited = true;
@@ -222,7 +233,11 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         config = resumed;
         return makeSession(sessionId);
       },
-      stop: async () => [],
+      stop: async () => {
+        record("stop");
+        if (stopErrors.length > 0) childForgotten = true;
+        return stopErrors;
+      },
       // Like the SDK: sessions disconnect, rejecting the request, before the process exits.
       forceStop: async () => {
         record("forceStop");
@@ -230,10 +245,19 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         if (stopFails) {
           throw new Error("Timed out waiting for CLI process to exit after SIGKILL: 10000ms");
         }
+        if (childForgotten) return;
         await exitGate;
         exitProcess();
       },
-      process: { id: 4242, hasExited: () => hasExited, exited },
+      process: {
+        id: 4242,
+        hasExited: () => hasExited,
+        exited,
+        kill: () => {
+          record("process.kill");
+          if (!stopFails) exitProcess();
+        },
+      },
     };
   };
   return {
@@ -281,6 +305,20 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
     failForceStop: () => {
       stopFails = true;
     },
+    /** stop() resolves with these errors, as the SDK does when the CLI ignores its kill. */
+    failStop: (errors: Array<Error>) => {
+      stopErrors = errors;
+    },
+    holdList: () => {
+      const held = gate();
+      listGates.push(held.promise);
+      return held.release;
+    },
+    /** The next tasks.list call never answers, though the connection stays open. */
+    hangList: () => {
+      listGates.push(new Promise<void>(() => {}));
+    },
+    hasExited: () => hasExitedNow(),
     holdSend: () => {
       let release!: () => void;
       sendGate = new Promise((resolve) => {
@@ -700,6 +738,45 @@ describe("CopilotSdkAdapterV2", () => {
       assert.strictEqual(stopped.threadDisposition, "broken");
       assert.strictEqual(stopped.failure.class, "usage_limit");
       assert.isTrue(fake.called("forceStop"));
+
+      // Nothing runs when T3 lists Copilot's tasks, but a steer Copilot took meanwhile may start
+      // more work, so T3 stops Copilot here too.
+      yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
+      fake.setRunningTasks(0);
+      const releaseList = fake.holdList();
+      const failing = yield* turnInput(
+        harness.providerThread,
+        [{ id: "mode", value: "https://agentclientprotocol.com/protocol/session-modes#autopilot" }],
+        3,
+      );
+      yield* harness.runtime.startTurn(failing);
+      const failingTurn = (yield* harness.takeRunningTurn()).id;
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.emit({
+        ...event,
+        type: "session.error",
+        data: { errorType: "rate_limit", message: "Rate limit exceeded", statusCode: 429 },
+      });
+      yield* fake.finishRun(new Error("Rate limit exceeded"));
+      yield* fake.takeCall("tasks.list");
+      yield* harness.runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: failing.runId,
+        providerThread: harness.providerThread,
+        providerTurnId: failingTurn,
+        message: { ...failing.message, messageId: MessageId.make("steer"), text: "Try again" },
+      });
+      yield* fake.emit({
+        ...event,
+        type: "user.message",
+        data: { messageId: "steer-message", content: "Try again", delivery: "idle" },
+      });
+      yield* releaseList;
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "failed",
+        threadDisposition: "broken",
+      });
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -1002,8 +1079,9 @@ describe("CopilotSdkAdapterV2", () => {
       assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
 
       // A task list Copilot cannot return gets a few fresh drains. A shell may still be running
-      // then, so T3 stops Copilot before it takes the thread back.
-      fake.failTaskLists(3);
+      // then, so T3 stops Copilot before it takes the thread back. The first list never answers.
+      fake.hangList();
+      fake.failTaskLists(2);
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, autopilot, 2));
       yield* fake.takeCall("sendAndWait");
       yield* fake.emit({
@@ -1012,7 +1090,9 @@ describe("CopilotSdkAdapterV2", () => {
         data: { toolCallId: "bg-unknown", toolName: "bash", arguments: { command: "pnpm dev" } },
       });
       yield* fake.finishRun();
-      yield* Effect.all(Array.from({ length: 3 }, () => fake.takeCall("tasks.list")));
+      yield* fake.takeCall("tasks.list");
+      yield* TestClock.adjust("15 seconds");
+      yield* Effect.all(Array.from({ length: 2 }, () => fake.takeCall("tasks.list")));
       const ended = (yield* harness.untilTerminal()).at(-1);
       if (ended?.type !== "turn.terminal") return assert.fail("no terminal");
       assert.deepInclude(ended, { status: "failed", threadDisposition: "broken" });
@@ -1093,7 +1173,8 @@ describe("CopilotSdkAdapterV2", () => {
   it.effect("relaunches Copilot and resumes its session after the CLI exits", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeCopilot();
-      const harness = yield* makeHarness(fake);
+      const sessionScope = yield* Scope.make();
+      const harness = yield* makeHarness(fake).pipe(Scope.provide(sessionScope));
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
       yield* fake.takeCall("sendAndWait");
       yield* fake.finishRun(new Error("Session disconnected while waiting for a response"));
@@ -1112,6 +1193,11 @@ describe("CopilotSdkAdapterV2", () => {
       );
       yield* harness.runtime.startTurn(yield* turnInput(resumed, [], 2));
       yield* fake.takeCall("sendAndWait");
+      // stop() reports a CLI that ignored its kill, then forgets it; T3 kills the one it launched.
+      fake.failStop([new Error("Timed out waiting for CLI process to exit after kill: 10000ms")]);
+      yield* Scope.close(sessionScope, Exit.void);
+      assert.isTrue(fake.called("process.kill"));
+      assert.isTrue(fake.hasExited());
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
