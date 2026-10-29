@@ -29,6 +29,8 @@ export interface CopilotSdkSession {
 }
 
 export interface CopilotSdkClient {
+  /** Spawns the CLI and runs the SDK's handshake with it. */
+  readonly start: () => Promise<void>;
   readonly createSession: (config: SessionConfig) => Promise<CopilotSdkSession>;
   readonly resumeSession: (
     sessionId: string,
@@ -36,7 +38,10 @@ export interface CopilotSdkClient {
   ) => Promise<CopilotSdkSession>;
   readonly stop: () => Promise<ReadonlyArray<Error>>;
   readonly forceStop: () => Promise<void>;
-  /** The Copilot process, so T3 can see it exit and stop its whole process tree. */
+  /**
+   * The Copilot process, so T3 can see it exit and stop its whole process tree. Undefined until
+   * start() spawned it; once read, kept, since a failed stop() clears the SDK's own field.
+   */
   readonly process: CopilotProcess | undefined;
 }
 
@@ -107,13 +112,17 @@ export const makeCopilotSdkClient: MakeCopilotSdkClient = async (options) => {
     workingDirectory: options.cwd,
     useLoggedInUser: true,
   });
-  await client.start();
+  let tracked: CopilotProcess | undefined;
   return {
+    start: () => client.start(),
     createSession: (config) => client.createSession(config),
     resumeSession: (sessionId, config) => client.resumeSession(sessionId, config),
     stop: () => client.stop(),
     forceStop: () => client.forceStop(),
-    process: copilotClientProcess(client),
+    get process() {
+      tracked ??= copilotClientProcess(client);
+      return tracked;
+    },
   };
 };
 

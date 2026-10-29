@@ -39,6 +39,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -77,7 +78,6 @@ const selection = (options: ModelSelection["options"] = []): ModelSelection => (
 });
 
 const COPILOT_MESSAGE_ID = "b6593215-0d4f-4c2e-9a51-3f0e7c2d1a44";
-const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 
 type CompactResult = Awaited<ReturnType<CopilotSdkSession["rpc"]["history"]["compact"]>>;
 
@@ -104,6 +104,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   const resumeFailures: Array<Error> = [];
   let created = 0;
   let hangAbort = false;
+  let startGate: Promise<void> | undefined;
   let permissionsHang = false;
   let stopFails = false;
   let stopErrors: Array<Error> = [];
@@ -242,6 +243,10 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         config = resumed;
         return makeSession(sessionId);
       },
+      start: async () => {
+        record("start");
+        await startGate;
+      },
       stop: async () => {
         record("stop");
         if (stopErrors.length > 0) childForgotten = true;
@@ -333,6 +338,12 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       listGates.push(new Promise<void>(() => {}));
     },
     hasExited: () => hasExitedNow(),
+    /** The next client's startup handshake waits until released. */
+    holdStart: () => {
+      const held = gate();
+      startGate = held.promise;
+      return held.release;
+    },
     /** Copilot never acknowledges permission responses, though the connection stays open. */
     hangPermissionResponses: () => {
       permissionsHang = true;
@@ -1337,6 +1348,15 @@ describe("CopilotSdkAdapterV2", () => {
 
   it.effect("relaunches Copilot and resumes its session after the CLI exits", () =>
     Effect.gen(function* () {
+      // A Stop during Copilot's startup handshake still stops the CLI that start() spawned.
+      const starting = yield* makeFakeCopilot();
+      const releaseStart = starting.holdStart();
+      const opening = yield* makeHarness(starting).pipe(Effect.forkScoped);
+      yield* starting.takeCall("start");
+      yield* Fiber.interrupt(opening);
+      assert.isTrue(starting.called("forceStop"));
+      yield* releaseStart;
+
       const fake = yield* makeFakeCopilot();
       const sessionScope = yield* Scope.make();
       const harness = yield* makeHarness(fake).pipe(Scope.provide(sessionScope));
@@ -1369,6 +1389,17 @@ describe("CopilotSdkAdapterV2", () => {
         },
       });
       yield* fake.takeCall("permissions.handlePendingPermissionRequest");
+      // That turn ends anyway, and the next one must survive the old approval's deadline.
+      yield* fake.finishRun();
+      yield* harness.untilTerminal();
+      yield* harness.runtime.startTurn(yield* turnInput(resumed, [], 3));
+      yield* fake.takeCall("sendAndWait");
+      yield* TestClock.adjust("30 seconds");
+      yield* fake.finishRun();
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "completed",
+      });
       // stop() reports a CLI that ignored its kill, then forgets it; T3 kills the one it launched.
       fake.failStop([new Error("Timed out waiting for CLI process to exit after kill: 10000ms")]);
       yield* Scope.close(sessionScope, Exit.void);
@@ -1538,10 +1569,7 @@ describe("CopilotSdkAdapterV2", () => {
       const smaller = yield* turnInput(harness.providerThread, [], 3);
       const gpt = { ...smaller, modelSelection: { ...smaller.modelSelection, model: "gpt-5.5" } };
       const refused = yield* harness.runtime.startTurn(gpt).pipe(Effect.flip);
-      assert.include(
-        isProtocolError(refused.cause) ? refused.cause.detail : undefined,
-        "Send /compact",
-      );
+      assert.include(makeProviderFailure({ cause: refused }).message, "Send /compact");
       const switchToGpt = [
         { modelId: "gpt-5.5", reasoningEffort: null, contextTier: "long_context" },
       ];

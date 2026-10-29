@@ -479,6 +479,23 @@ const failureClass = (error: CopilotError | undefined) =>
 
 const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 
+/**
+ * Raised when Copilot refuses a model switch because the conversation does not fit the target
+ * model's context. `makeProviderFailure` shows its message to the user.
+ */
+class CopilotModelSwitchError extends Schema.TaggedError<CopilotModelSwitchError>()(
+  "CopilotModelSwitchError",
+  {
+    model: Schema.String,
+    currentTokens: Schema.Number,
+    targetLimit: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Copilot did not switch to ${this.model}: the conversation (${this.currentTokens} tokens) does not fit its ${this.targetLimit}-token limit. Send /compact, then try again.`;
+  }
+}
+
 const errorText = (cause: unknown) =>
   cause instanceof Error && cause.message.trim().length > 0 ? cause.message : undefined;
 
@@ -618,18 +635,26 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         { ...options.environment, ...spawn.env },
         yield* mcpSessions.read(input.threadId),
       );
-      const launchClient = Effect.tryPromise({
-        try: () =>
-          makeClient({
-            cliPath,
-            cwd,
-            env: Object.fromEntries(
-              Object.entries(environment).filter(
-                (entry): entry is [string, string] => entry[1] !== undefined,
+      const launchClient = Effect.gen(function* () {
+        const created = yield* Effect.tryPromise({
+          try: () =>
+            makeClient({
+              cliPath,
+              cwd,
+              env: Object.fromEntries(
+                Object.entries(environment).filter(
+                  (entry): entry is [string, string] => entry[1] !== undefined,
+                ),
               ),
-            ),
-          }),
-        catch: (cause) => protocolError("Could not start Copilot", cause),
+            }),
+          catch: (cause) => protocolError("Could not start Copilot", cause),
+        });
+        // Owned before the handshake, so a Stop or a failure during it still stops the CLI.
+        yield* Effect.tryPromise({
+          try: () => created.start(),
+          catch: (cause) => protocolError("Could not start Copilot", cause),
+        }).pipe(Effect.onError(() => terminate(created).pipe(Effect.asVoid)));
+        return created;
       });
       // The SDK's kill reaches only copilot.exe on Windows; taskkill /T also stops its shells and agents.
       const killProcessTree = Effect.fnUntraced(function* (pid: number) {
@@ -1654,8 +1679,17 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
 
       /** Copilot left an RPC unanswered, so T3 stops it rather than wait, as for an interrupt. */
       const stopUnresponsive = Effect.fnUntraced(
-        function* (detail: string) {
-          const turn = active;
+        function* (
+          detail: string,
+          sender: { readonly turn: ActiveTurn | undefined; readonly client: CopilotSdkClient },
+        ) {
+          // An answer can outlive its turn; once Copilot moved past it, nothing is stuck.
+          if (sender.client !== client || sender.turn !== active) {
+            return yield* Effect.logWarning("Copilot never answered an earlier request", {
+              detail,
+            });
+          }
+          const turn = sender.turn;
           if (turn !== undefined) return yield* killTurn(turn, "failed", detail);
           // No turn ends, so the thread's error status makes T3 resume it on a new process.
           markBroken();
@@ -1671,12 +1705,26 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         Effect.forkIn(sessionScope),
         Effect.asVoid,
       );
-      const unanswered = (operation: string) =>
-        stopUnresponsive(`Copilot did not answer the ${operation} in time.`).pipe(
-          Effect.andThen(
-            Effect.fail(protocolError(`Copilot did not answer the ${operation} in time`)),
-          ),
-        );
+      /** Bounds an RPC; if Copilot never answers, T3 stops the turn and client that sent it. */
+      const bounded = <A, E>(
+        operation: string,
+        deadline: Duration.Input,
+        rpc: Effect.Effect<A, E>,
+      ) =>
+        Effect.suspend(() => {
+          const sender = { turn: active, client };
+          return rpc.pipe(
+            Effect.timeoutOrElse({
+              duration: deadline,
+              orElse: () =>
+                stopUnresponsive(`Copilot did not answer the ${operation} in time.`, sender).pipe(
+                  Effect.andThen(
+                    Effect.fail(protocolError(`Copilot did not answer the ${operation} in time`)),
+                  ),
+                ),
+            }),
+          );
+        });
       /** Whether Copilot lists a running task; undefined when it cannot say in time. */
       const listsRunningTasks = (target: CopilotSdkSession) =>
         Effect.tryPromise(() => target.rpc.tasks.list()).pipe(
@@ -2357,11 +2405,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                 : "Copilot could not resume this session",
               cause,
             ),
-        }).pipe(
-          Effect.timeoutOrElse({
-            duration: SESSION_OPEN_TIMEOUT,
-            orElse: () => unanswered(requestedId === undefined ? "new session" : "session resume"),
-          }),
+        }).pipe((open) =>
+          bounded(
+            requestedId === undefined ? "new session" : "session resume",
+            SESSION_OPEN_TIMEOUT,
+            open,
+          ),
         );
         session = opened;
         currentSettings = settings;
@@ -2414,11 +2463,13 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         candidate.appThreadId === thread.appThreadId &&
         candidate.nativeThreadRef?.nativeId === session.sessionId;
       const call = <A>(operation: string, run: () => Promise<A>) =>
-        Effect.tryPromise({
-          try: run,
-          catch: (cause) => protocolError(`Copilot ${operation} failed`, cause),
-        }).pipe(
-          Effect.timeoutOrElse({ duration: RPC_TIMEOUT, orElse: () => unanswered(operation) }),
+        bounded(
+          operation,
+          RPC_TIMEOUT,
+          Effect.tryPromise({
+            try: run,
+            catch: (cause) => protocolError(`Copilot ${operation} failed`, cause),
+          }),
         );
       const applySettings = Effect.fnUntraced(function* (
         target: CopilotSdkSession,
@@ -2440,9 +2491,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           const confirmation = switched.confirmation;
           if (confirmation !== undefined) {
             applied = {};
-            return yield* protocolError(
-              `Copilot did not switch to ${confirmation.targetModelDisplayName}: the conversation (${confirmation.currentTokens} tokens) does not fit its ${confirmation.targetLimit}-token limit. Send /compact, then try again.`,
-            );
+            return yield* new CopilotModelSwitchError({
+              model: confirmation.targetModelDisplayName,
+              currentTokens: confirmation.currentTokens,
+              targetLimit: confirmation.targetLimit,
+            });
           }
           // A deferred switch is queued ahead of the prompt but not applied yet.
           if (switched.deferred === true) {
