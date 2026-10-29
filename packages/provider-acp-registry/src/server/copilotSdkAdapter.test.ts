@@ -877,7 +877,7 @@ describe("CopilotSdkAdapterV2", () => {
         ]),
       );
       assert.deepStrictEqual((yield* fake.takeCall("model.switchTo")).args, [
-        { modelId: "claude-sonnet-4.5", reasoningEffort: "high" },
+        { modelId: "claude-sonnet-4.5", reasoningEffort: "high", contextTier: "long_context" },
       ]);
       assert.deepStrictEqual((yield* fake.takeCall("mode.set")).args, [{ mode: "autopilot" }]);
       assert.deepStrictEqual((yield* fake.takeCall("permissions.setMode")).args, [
@@ -889,7 +889,7 @@ describe("CopilotSdkAdapterV2", () => {
       // Dropping the effort option must clear Copilot's override, not keep "high".
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, [], 2));
       assert.deepStrictEqual((yield* fake.takeCall("model.switchTo")).args, [
-        { modelId: "claude-sonnet-4.5", reasoningEffort: null },
+        { modelId: "claude-sonnet-4.5", reasoningEffort: null, contextTier: "long_context" },
       ]);
       yield* fake.takeCall("sendAndWait");
       yield* fake.finishRun();
@@ -915,85 +915,102 @@ describe("CopilotSdkAdapterV2", () => {
           (yield* fake.takeCall("model.switchTo")).args,
         ],
         [
-          [{ modelId: "gpt-5.5", reasoningEffort: null }],
-          [{ modelId: "gpt-5.5", reasoningEffort: null }],
+          [{ modelId: "gpt-5.5", reasoningEffort: null, contextTier: "long_context" }],
+          [{ modelId: "gpt-5.5", reasoningEffort: null, contextTier: "long_context" }],
         ],
       );
       yield* fake.takeCall("sendAndWait");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.effect("resumes the persisted Copilot session with T3's system message and MCP server", () =>
-    Effect.gen(function* () {
-      yield* (yield* McpProviderSessions.McpProviderSessions).set({
-        environmentId: EnvironmentId.make("environment-copilot"),
-        threadId: THREAD_ID,
-        providerSessionId: "session-copilot",
-        providerInstanceId: INSTANCE_ID,
-        endpoint: "http://127.0.0.1:43210/mcp",
-        authorizationHeader: "Bearer thread-token",
-        browserToolsAvailable: false,
-      });
-      const now = yield* DateTime.now;
-      const driver = ProviderDriverKind.make("acpRegistry");
-      const saved: OrchestrationV2ProviderThread = {
-        id: (yield* IdAllocator.IdAllocatorV2).derive.providerThread({
+  it.effect(
+    "opens Copilot sessions with T3's system message, MCP server, delegation and tier",
+    () =>
+      Effect.gen(function* () {
+        yield* (yield* McpProviderSessions.McpProviderSessions).set({
+          environmentId: EnvironmentId.make("environment-copilot"),
+          threadId: THREAD_ID,
+          providerSessionId: "session-copilot",
+          providerInstanceId: INSTANCE_ID,
+          endpoint: "http://127.0.0.1:43210/mcp",
+          authorizationHeader: "Bearer thread-token",
+          browserToolsAvailable: false,
+        });
+        const now = yield* DateTime.now;
+        const driver = ProviderDriverKind.make("acpRegistry");
+        const saved: OrchestrationV2ProviderThread = {
+          id: (yield* IdAllocator.IdAllocatorV2).derive.providerThread({
+            driver,
+            providerInstanceId: INSTANCE_ID,
+            nativeThreadId: "copilot-native-1",
+          }),
           driver,
           providerInstanceId: INSTANCE_ID,
-          nativeThreadId: "copilot-native-1",
-        }),
-        driver,
-        providerInstanceId: INSTANCE_ID,
-        providerSessionId: ProviderSessionId.make("session-copilot"),
-        appThreadId: THREAD_ID,
-        ownerNodeId: null,
-        nativeThreadRef: {
-          driver,
-          nativeId: "copilot-native-1",
-          strength: "strong",
-        },
-        nativeConversationHeadRef: null,
-        status: "idle",
-        firstRunOrdinal: 1,
-        lastRunOrdinal: 1,
-        handoffIds: [],
-        forkedFrom: null,
-        createdAt: now,
-        updatedAt: now,
-      };
+          providerSessionId: ProviderSessionId.make("session-copilot"),
+          appThreadId: THREAD_ID,
+          ownerNodeId: null,
+          nativeThreadRef: {
+            driver,
+            nativeId: "copilot-native-1",
+            strength: "strong",
+          },
+          nativeConversationHeadRef: null,
+          status: "idle",
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        };
 
-      const broken = yield* makeFakeCopilot();
-      broken.resumeFailures.push(new Error("Session not found"));
-      const failed = yield* makeHarness(broken, saved).pipe(Effect.result);
-      assert.strictEqual(failed._tag, "Failure");
+        const broken = yield* makeFakeCopilot();
+        broken.resumeFailures.push(new Error("Session not found"));
+        const failed = yield* makeHarness(broken, saved).pipe(Effect.result);
+        assert.strictEqual(failed._tag, "Failure");
 
-      const fake = yield* makeFakeCopilot();
-      yield* makeHarness(fake, saved);
-      assert.strictEqual(fake.resumes.length, 1);
-      const { sessionId, config } = fake.resumes[0]!;
-      assert.strictEqual(sessionId, "copilot-native-1");
-      assert.deepStrictEqual(config.mcpServers, {
-        "t3-code": {
-          type: "http",
-          url: "http://127.0.0.1:43210/mcp",
-          headers: { Authorization: "Bearer thread-token" },
-          tools: ["*"],
-        },
-      });
-      assert.deepInclude(config.systemMessage, {
-        mode: "customize",
-        sections: { tone: { action: "remove" } },
-      });
-      assert.include(
-        config.systemMessage?.content,
-        "running in T3 Code through the GitHub Copilot harness",
-      );
-      assert.include(config.systemMessage?.content, "## T3 Code orchestration");
-      assert.deepStrictEqual(
-        fake.launches.map((launch) => launch.cliPath),
-        ["/opt/copilot/bin/copilot"],
-      );
-    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+        const fake = yield* makeFakeCopilot();
+        yield* makeHarness(fake, saved);
+        assert.strictEqual(fake.resumes.length, 1);
+        const { sessionId, config } = fake.resumes[0]!;
+        assert.strictEqual(sessionId, "copilot-native-1");
+        assert.deepStrictEqual(config.mcpServers, {
+          "t3-code": {
+            type: "http",
+            url: "http://127.0.0.1:43210/mcp",
+            headers: { Authorization: "Bearer thread-token" },
+            tools: ["*"],
+          },
+        });
+        assert.deepInclude(config.systemMessage, {
+          mode: "customize",
+          sections: { tone: { action: "remove" } },
+        });
+        assert.include(
+          config.systemMessage?.content,
+          "running in T3 Code through the GitHub Copilot harness",
+        );
+        assert.include(config.systemMessage?.content, "## T3 Code orchestration");
+        assert.deepStrictEqual(
+          fake.launches.map((launch) => launch.cliPath),
+          ["/opt/copilot/bin/copilot"],
+        );
+        // With T3's MCP server the main agent delegates through delegate_task, on create and resume.
+        const delegation = {
+          contextTier: "long_context",
+          defaultAgent: { excludedTools: ["task", "read_agent", "write_agent", "list_agents"] },
+        } satisfies Partial<SessionConfig>;
+        assert.deepInclude(config, delegation);
+        const created = yield* makeFakeCopilot();
+        yield* makeHarness(created);
+        assert.deepInclude(created.config(), delegation);
+        // Without it, Copilot keeps its own delegation tools.
+        yield* (yield* McpProviderSessions.McpProviderSessions).clear(THREAD_ID);
+        const native = yield* makeFakeCopilot();
+        yield* makeHarness(native);
+        assert.deepInclude(native.config(), { contextTier: "long_context" });
+        assert.notProperty(native.config(), "defaultAgent");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
   it.effect("runs Copilot tasks as subagents with their own child threads", () =>
     Effect.gen(function* () {

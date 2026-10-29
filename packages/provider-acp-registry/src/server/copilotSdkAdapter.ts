@@ -394,6 +394,12 @@ const SUBAGENT_TOOL = "task";
 // report_intent drives Copilot's status line; exit_plan_mode shows as the proposed plan.
 const HIDDEN_TOOLS = new Set(["report_intent", "exit_plan_mode"]);
 const QUESTION_ID = "answer";
+// With T3's MCP server the main agent delegates through delegate_task, so T3 owns child threads,
+// waits and restarts. Copilot matches these as runtime tool names; builtin: patterns do not apply
+// here, and MCP tools are always <server>-<tool>, so they cannot collide.
+const COPILOT_DELEGATION_TOOLS = ["task", "read_agent", "write_agent", "list_agents"];
+// Models with a long-context tier use it; a model switch drops the tier unless it is passed again.
+const CONTEXT_TIER = "long_context";
 const PLAN_CAPTURED_FEEDBACK =
   "T3 Code captured your proposed plan. Stop here and wait for the user's feedback or implementation request in a later turn.";
 
@@ -2031,7 +2037,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             : { reasoningEffort: settings.reasoningEffort }),
           workingDirectory: cwd,
           streaming: true,
+          contextTier: CONTEXT_TIER,
           systemMessage: systemMessage(mcp),
+          ...(mcp === undefined
+            ? {}
+            : { defaultAgent: { excludedTools: [...COPILOT_DELEGATION_TOOLS] } }),
           ...(mcp === undefined
             ? {}
             : {
@@ -2132,6 +2142,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             target.rpc.model.switchTo({
               modelId: settings.model,
               reasoningEffort: settings.reasoningEffort ?? null,
+              contextTier: CONTEXT_TIER,
             }),
           );
           // A confirmation means Copilot did not switch: the target model's context is too small.
