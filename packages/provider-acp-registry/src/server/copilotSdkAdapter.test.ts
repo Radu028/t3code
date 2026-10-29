@@ -104,6 +104,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   const resumeFailures: Array<Error> = [];
   let created = 0;
   let hangAbort = false;
+  let permissionsHang = false;
   let stopFails = false;
   let stopErrors: Array<Error> = [];
   // After a stop() that reported errors the SDK no longer tracks its child.
@@ -173,6 +174,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         },
         handlePendingPermissionRequest: async (params) => {
           record("permissions.handlePendingPermissionRequest", params);
+          if (permissionsHang) return new Promise<never>(() => {});
           // Copilot reports the outcome before it acknowledges the response.
           config?.onEvent?.({
             ...event,
@@ -331,6 +333,10 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       listGates.push(new Promise<void>(() => {}));
     },
     hasExited: () => hasExitedNow(),
+    /** Copilot never acknowledges permission responses, though the connection stays open. */
+    hangPermissionResponses: () => {
+      permissionsHang = true;
+    },
     /** Copilot never acknowledges the next steer. */
     hangSend: () => {
       sendGate = new Promise<void>(() => {});
@@ -1352,9 +1358,21 @@ describe("CopilotSdkAdapterV2", () => {
       );
       yield* harness.runtime.startTurn(yield* turnInput(resumed, [], 2));
       yield* fake.takeCall("sendAndWait");
+      // An automatic approval Copilot never acknowledges must not keep cleanup from the session.
+      fake.hangPermissionResponses();
+      yield* fake.emit({
+        ...event,
+        type: "permission.requested",
+        data: {
+          requestId: "perm-auto",
+          permissionRequest: { kind: "read", intention: "Read", path: "/etc/hosts" },
+        },
+      });
+      yield* fake.takeCall("permissions.handlePendingPermissionRequest");
       // stop() reports a CLI that ignored its kill, then forgets it; T3 kills the one it launched.
       fake.failStop([new Error("Timed out waiting for CLI process to exit after kill: 10000ms")]);
       yield* Scope.close(sessionScope, Exit.void);
+      assert.isTrue(fake.called("stop"));
       assert.isTrue(fake.called("process.kill"));
       assert.isTrue(fake.hasExited());
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
@@ -1994,7 +2012,9 @@ describe("CopilotSdkAdapterV2", () => {
             item.type === "runtime_request.updated" &&
             item.runtimeRequest.nativeRequestRef?.nativeId === nativeId,
         );
-        return request.type === "runtime_request.updated" ? request.runtimeRequest.id : "";
+        return request.type === "runtime_request.updated"
+          ? request.runtimeRequest.id
+          : assert.fail("no request");
       });
       yield* fake.emit(shellPermission("perm-gone", "pnpm publish"));
       const gone = yield* opened("perm-gone");
@@ -2020,6 +2040,27 @@ describe("CopilotSdkAdapterV2", () => {
           { request: "cancelled", card: "cancelled" },
         ],
       );
+
+      // Copilot never acknowledges an answer. T3 runs a Stop only after this delivery, so the
+      // delivery fails after its bound and T3 stops the silent Copilot.
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, [], 2));
+      yield* fake.takeCall("sendAndWait");
+      fake.hangPermissionResponses();
+      yield* fake.emit(shellPermission("perm-stuck", "pnpm publish"));
+      const stuck = yield* opened("perm-stuck");
+      yield* harness.takeEvent(isCard(stuck));
+      const answering = yield* harness
+        .respond({ requestId: stuck, decision: "accept" })
+        .pipe(Effect.forkScoped);
+      yield* fake.takeCall("permissions.handlePendingPermissionRequest");
+      yield* TestClock.adjust("30 seconds");
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(answering)));
+      assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
+        type: "turn.terminal",
+        status: "failed",
+        threadDisposition: "broken",
+      });
+      assert.isTrue(fake.called("forceStop"));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

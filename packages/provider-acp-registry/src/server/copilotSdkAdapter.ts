@@ -93,8 +93,11 @@ const DRIVER = ProviderDriverKind.make("acpRegistry");
 /** Node's setTimeout ceiling: a turn ends on Copilot's completion, never on a timer. */
 const TURN_COMPLETION_TIMEOUT_MS = 2_147_483_647;
 const INTERRUPT_CONFIRMATION_TIMEOUT: Duration.Input = "30 seconds";
-// T3 runs a thread's effects one at a time, so a Stop queued behind a steer waits for it.
-const STEER_DELIVERY_TIMEOUT: Duration.Input = "30 seconds";
+// T3 runs a thread's effects one at a time, so a Stop queued behind an RPC waits for it. The
+// turn's own request and /compact are Copilot's work, not an answer, and stay unbounded.
+const RPC_TIMEOUT: Duration.Input = "30 seconds";
+// Opening or resuming a session can start MCP servers and load a long transcript.
+const SESSION_OPEN_TIMEOUT: Duration.Input = "2 minutes";
 const TEXT_FLUSH_INTERVAL: Duration.Input = "50 millis";
 const CLIENT_STOP_TIMEOUT: Duration.Input = "15 seconds";
 // The CLI ends waitForPending itself after ten minutes; this bounds an answer that never comes.
@@ -1497,12 +1500,13 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             request.kind === "read" ||
             (policy.runtimeMode === "auto-accept-edits" && request.kind === "write"));
         if (automatic) {
-          return yield* Effect.tryPromise(() =>
+          // Forked: this runs under the event permit, which cleanup must always be able to take.
+          return yield* call("automatic approval", () =>
             target.rpc.permissions.handlePendingPermissionRequest({
               requestId: data.requestId,
               result: { kind: "approve-once" },
             }),
-          ).pipe(Effect.ignore);
+          ).pipe(Effect.ignore, Effect.forkIn(sessionScope), Effect.asVoid);
         }
         const presentation = permissionPresentation(request);
         yield* openRequest(
@@ -1648,6 +1652,31 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         }).pipe(eventPermit.withPermits(1));
       });
 
+      /** Copilot left an RPC unanswered, so T3 stops it rather than wait, as for an interrupt. */
+      const stopUnresponsive = Effect.fnUntraced(
+        function* (detail: string) {
+          const turn = active;
+          if (turn !== undefined) return yield* killTurn(turn, "failed", detail);
+          // No turn ends, so the thread's error status makes T3 resume it on a new process.
+          markBroken();
+          const failure = yield* terminate(client);
+          yield* Effect.gen(function* () {
+            yield* updateThread({ status: "error" });
+            yield* updateSession(
+              "error",
+              failure === undefined ? detail : `${detail} It may still be running (${failure}).`,
+            );
+          }).pipe(eventPermit.withPermits(1));
+        },
+        Effect.forkIn(sessionScope),
+        Effect.asVoid,
+      );
+      const unanswered = (operation: string) =>
+        stopUnresponsive(`Copilot did not answer the ${operation} in time.`).pipe(
+          Effect.andThen(
+            Effect.fail(protocolError(`Copilot did not answer the ${operation} in time`)),
+          ),
+        );
       /** Whether Copilot lists a running task; undefined when it cannot say in time. */
       const listsRunningTasks = (target: CopilotSdkSession) =>
         Effect.tryPromise(() => target.rpc.tasks.list()).pipe(
@@ -2241,7 +2270,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           const replaced = session;
           session = undefined;
           sessionEpoch++;
-          yield* Effect.tryPromise(() => replaced.disconnect()).pipe(Effect.ignore);
+          // Dropped either way; a silent CLI is caught by the session open that follows.
+          yield* Effect.tryPromise(() => replaced.disconnect()).pipe(
+            Effect.timeoutOption(RPC_TIMEOUT),
+            Effect.ignore,
+          );
         }
         if (broken) {
           const failure = yield* terminate(client);
@@ -2324,7 +2357,12 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                 : "Copilot could not resume this session",
               cause,
             ),
-        });
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: SESSION_OPEN_TIMEOUT,
+            orElse: () => unanswered(requestedId === undefined ? "new session" : "session resume"),
+          }),
+        );
         session = opened;
         currentSettings = settings;
         // A resumed session may hold an older effort override; its first turn sets both again.
@@ -2379,7 +2417,9 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         Effect.tryPromise({
           try: run,
           catch: (cause) => protocolError(`Copilot ${operation} failed`, cause),
-        });
+        }).pipe(
+          Effect.timeoutOrElse({ duration: RPC_TIMEOUT, orElse: () => unanswered(operation) }),
+        );
       const applySettings = Effect.fnUntraced(function* (
         target: CopilotSdkSession,
         settings: CopilotSessionSettings,
@@ -2709,24 +2749,18 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             // The event permit keeps the turn from settling during delivery, so the recorded id
             // tells settle whether Copilot owes this steer a run. Not the commands lock: Stop must
             // still run while a send hangs, and its kill rejects that send.
-            const delivered = yield* Effect.gen(function* () {
+            yield* Effect.gen(function* () {
               if (active !== turn || session !== target || turn.interruptRequested) {
                 return yield* protocolError("The Copilot turn ended before the steer was sent");
               }
               // Immediate delivery joins the running turn and leaves background agents running.
-              const messageId = yield* call("steering", () =>
+              // Unanswered, Copilot may still have taken it, and its run could never be matched to
+              // this turn; call's timeout stops Copilot, so no work is left behind.
+              const messageId = yield* call("steering message", () =>
                 target.send({ ...message, mode: "immediate" }),
-              ).pipe(Effect.timeoutOption(STEER_DELIVERY_TIMEOUT));
-              if (Option.isSome(messageId)) turn.steers.add(messageId.value);
-              return Option.isSome(messageId);
+              );
+              turn.steers.add(messageId);
             }).pipe(eventPermit.withPermits(1));
-            if (delivered) return;
-            // Copilot may have taken the message, and its run could never be matched to this
-            // turn, so only stopping Copilot leaves no work behind.
-            yield* killTurn(turn, "failed", "Copilot did not acknowledge a steering message.").pipe(
-              Effect.forkIn(sessionScope),
-            );
-            return yield* protocolError("Copilot did not acknowledge the steering message in time");
           },
           (effect, args) =>
             effect.pipe(
