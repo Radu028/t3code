@@ -1,4 +1,5 @@
-// @effect-diagnostics nodeBuiltinImport:off -- Windows path math must run on any host for the shim lookup.
+// @effect-diagnostics nodeBuiltinImport:off -- Windows path math must run on any host for the shim lookup, and the SDK's child is a Node ChildProcess.
+import * as NodeChildProcess from "node:child_process";
 import * as NodePath from "node:path";
 import type {
   CopilotSession,
@@ -22,6 +23,7 @@ export interface CopilotSdkSession {
       CopilotSession["rpc"]["permissions"],
       "setMode" | "handlePendingPermissionRequest"
     >;
+    readonly tasks: Pick<CopilotSession["rpc"]["tasks"], "waitForPending">;
   };
 }
 
@@ -33,6 +35,8 @@ export interface CopilotSdkClient {
   ) => Promise<CopilotSdkSession>;
   readonly stop: () => Promise<ReadonlyArray<Error>>;
   readonly forceStop: () => Promise<void>;
+  /** The Copilot process, so T3 can see it exit and stop its whole process tree. */
+  readonly process: { readonly id: number; readonly exited: Promise<void> } | undefined;
 }
 
 export interface CopilotSdkClientOptions {
@@ -48,11 +52,30 @@ export type MakeCopilotSdkClient = (options: CopilotSdkClientOptions) => Promise
 export const makeCopilotSdkClient: MakeCopilotSdkClient = async (options) => {
   const { CopilotClient, RuntimeConnection } = await import("@github/copilot-sdk");
   // An explicit stdio connection keeps the SDK off its koffi-backed in-process transport.
-  return new CopilotClient({
+  const client = new CopilotClient({
     connection: RuntimeConnection.forStdio({ path: options.cliPath, env: { ...options.env } }),
     workingDirectory: options.cwd,
     useLoggedInUser: true,
   });
+  await client.start();
+  // SDK 1.0.28 has no exit notification or pid accessor; its spawned child is a private field.
+  const child: unknown = Reflect.get(client, "cliProcess");
+  return {
+    createSession: (config) => client.createSession(config),
+    resumeSession: (sessionId, config) => client.resumeSession(sessionId, config),
+    stop: () => client.stop(),
+    forceStop: () => client.forceStop(),
+    process:
+      child instanceof NodeChildProcess.ChildProcess && child.pid !== undefined
+        ? {
+            id: child.pid,
+            exited:
+              child.exitCode !== null || child.signalCode !== null
+                ? Promise.resolve()
+                : new Promise((resolve) => child.once("exit", () => resolve())),
+          }
+        : undefined,
+  };
 };
 
 const WINDOWS_SHIM_EXTENSIONS = new Set([".cmd", ".bat", ".ps1", ""]);

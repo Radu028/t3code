@@ -9,6 +9,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -18,11 +19,14 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Sink from "effect/Sink";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -60,6 +64,8 @@ const selection = (options: ModelSelection["options"] = []): ModelSelection => (
   options,
 });
 
+const COPILOT_MESSAGE_ID = "b6593215-0d4f-4c2e-9a51-3f0e7c2d1a44";
+
 // Only fields the projection reads; the rest of each event is runtime bookkeeping.
 const event = { id: "event", parentId: null, timestamp: "2026-10-29T00:00:00.000Z" } as const;
 
@@ -70,8 +76,11 @@ interface Call {
 
 const makeFakeCopilot = Effect.fnUntraced(function* () {
   const calls = yield* Queue.unbounded<Call>();
-  const record = (method: string, ...args: ReadonlyArray<unknown>) =>
+  const history: Array<string> = [];
+  const record = (method: string, ...args: ReadonlyArray<unknown>) => {
+    history.push(method);
     Queue.offerUnsafe(calls, { method, args });
+  };
   let config: SessionConfig | ResumeSessionConfig | undefined;
   let finishRun: ((error?: Error) => void) | undefined;
   const launches: Array<CopilotSdkClientOptions> = [];
@@ -80,6 +89,17 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
   let created = 0;
   let hangAbort = false;
   let sendGate: Promise<void> | undefined;
+  let exitGate: Promise<void> | undefined;
+  let drainGate: Promise<void> | undefined;
+  const switchResults: Array<Awaited<ReturnType<CopilotSdkSession["rpc"]["model"]["switchTo"]>>> =
+    [];
+  const gate = () => {
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { promise, release: Effect.sync(() => release()) };
+  };
   const makeSession = (sessionId: string): CopilotSdkSession => ({
     sessionId,
     send: async (options) => {
@@ -105,7 +125,7 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
       model: {
         switchTo: async (params) => {
           record("model.switchTo", params);
-          return { modelId: params.modelId };
+          return switchResults.shift() ?? { modelId: params.modelId };
         },
       },
       mode: {
@@ -121,30 +141,59 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
         },
         handlePendingPermissionRequest: async (params) => {
           record("permissions.handlePendingPermissionRequest", params);
+          // Copilot reports the outcome before it acknowledges the response.
+          config?.onEvent?.({
+            ...event,
+            type: "permission.completed",
+            data: {
+              requestId: params.requestId,
+              result: {
+                kind: params.result.kind === "reject" ? "denied-interactively-by-user" : "approved",
+              },
+            },
+          });
           return { success: true };
+        },
+      },
+      tasks: {
+        waitForPending: async () => {
+          record("tasks.waitForPending");
+          await drainGate;
+          return {};
         },
       },
     },
   });
-  const client: CopilotSdkClient = {
-    createSession: async (opened) => {
-      record("createSession", opened);
-      config = opened;
-      return makeSession(`copilot-native-${++created}`);
-    },
-    resumeSession: async (sessionId, resumed) => {
-      record("resumeSession", sessionId);
-      resumes.push({ sessionId, config: resumed });
-      const failure = resumeFailures.shift();
-      if (failure) throw failure;
-      config = resumed;
-      return makeSession(sessionId);
-    },
-    stop: async () => [],
-    forceStop: async () => {
-      record("forceStop");
-      finishRun?.(new Error("Session disconnected while waiting for a response"));
-    },
+  let exitProcess: () => void = () => {};
+  // Each launch is its own process, as relaunching the SDK client is.
+  const makeClient = (): CopilotSdkClient => {
+    const exited = new Promise<void>((resolve) => {
+      exitProcess = resolve;
+    });
+    return {
+      createSession: async (opened) => {
+        record("createSession", opened);
+        config = opened;
+        return makeSession(`copilot-native-${++created}`);
+      },
+      resumeSession: async (sessionId, resumed) => {
+        record("resumeSession", sessionId);
+        resumes.push({ sessionId, config: resumed });
+        const failure = resumeFailures.shift();
+        if (failure) throw failure;
+        config = resumed;
+        return makeSession(sessionId);
+      },
+      stop: async () => [],
+      // Like the SDK: sessions disconnect, rejecting the request, before the process exits.
+      forceStop: async () => {
+        record("forceStop");
+        finishRun?.(new Error("Session disconnected while waiting for a response"));
+        await exitGate;
+        exitProcess();
+      },
+      process: { id: 4242, exited },
+    };
   };
   return {
     launches,
@@ -152,7 +201,22 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
     resumeFailures,
     makeClient: async (options: CopilotSdkClientOptions) => {
       launches.push(options);
-      return client;
+      return makeClient();
+    },
+    called: (method: string) => history.includes(method),
+    exitProcess: () => Effect.sync(() => exitProcess()),
+    holdExit: () => {
+      const held = gate();
+      exitGate = held.promise;
+      return held.release;
+    },
+    holdDrain: () => {
+      const held = gate();
+      drainGate = held.promise;
+      return held.release;
+    },
+    queueSwitchResult: (result: (typeof switchResults)[number]) => {
+      switchResults.push(result);
     },
     config: () => config,
     hangAbort: () => {
@@ -179,11 +243,12 @@ const makeFakeCopilot = Effect.fnUntraced(function* () {
 const makeHarness = Effect.fnUntraced(function* (
   fake: Effect.Success<ReturnType<typeof makeFakeCopilot>>,
   existingProviderThread?: OrchestrationV2ProviderThread,
+  environment: NodeJS.ProcessEnv = { PATH: "/usr/bin" },
 ) {
   const adapter = yield* makeCopilotSdkAdapterV2({
     instanceId: INSTANCE_ID,
     settings,
-    environment: { PATH: "/usr/bin" },
+    environment,
     resolveSpawn: () =>
       Effect.succeed({ command: "/opt/copilot/bin/copilot", args: ["--acp"], env: {} }),
     makeClient: fake.makeClient,
@@ -221,15 +286,18 @@ const makeHarness = Effect.fnUntraced(function* (
       if (matches(next)) return next;
     }
   });
-  const untilTerminal = Effect.fnUntraced(function* () {
+  const until = Effect.fnUntraced(function* (
+    matches: (item: ProviderAdapter.ProviderAdapterV2Event) => boolean,
+  ) {
     const seen: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
     while (true) {
       const next = yield* Queue.take(emitted);
       seen.push(next);
-      if (next.type === "turn.terminal") return seen;
+      if (matches(next)) return seen;
     }
   });
-  return { runtime, providerThread, takeRunningTurn, takeEvent, untilTerminal };
+  const untilTerminal = () => until((item) => item.type === "turn.terminal");
+  return { runtime, providerThread, takeRunningTurn, takeEvent, until, untilTerminal };
 });
 
 const turnInput = Effect.fnUntraced(function* (
@@ -306,7 +374,17 @@ describe("CopilotSdkAdapterV2", () => {
     Effect.gen(function* () {
       const fake = yield* makeFakeCopilot();
       const harness = yield* makeHarness(fake);
-      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      // An imported thread's provider thread and run-attempt ids are long derived ids.
+      const importedThread = {
+        ...harness.providerThread,
+        id: ProviderThreadId.make(
+          `provider-thread:provider:acpRegistry:provider-instance:acpRegistry_copilot:native-thread:${"2bc5779c-9d1e-4a6b-8f02-6c1d3e5a7b90".repeat(3)}`,
+        ),
+      };
+      const attemptId = RunAttemptId.make(
+        `run-attempt:run:run%3Athread%3Athread%253Aprovider%253A${"x".repeat(160)}:attempt:1`,
+      );
+      yield* harness.runtime.startTurn({ ...(yield* turnInput(importedThread)), attemptId });
       const sent = yield* fake.takeCall("sendAndWait");
       assert.deepStrictEqual(sent.args, [{ prompt: "Fix the build" }, 2_147_483_647]);
 
@@ -326,18 +404,18 @@ describe("CopilotSdkAdapterV2", () => {
           ...event,
           type: "assistant.message_delta",
           ephemeral: true,
-          data: { messageId: "m1", deltaContent: "Running " },
+          data: { messageId: COPILOT_MESSAGE_ID, deltaContent: "Running " },
         },
         {
           ...event,
           type: "assistant.message_delta",
           ephemeral: true,
-          data: { messageId: "m1", deltaContent: "the build." },
+          data: { messageId: COPILOT_MESSAGE_ID, deltaContent: "the build." },
         },
         {
           ...event,
           type: "assistant.message",
-          data: { messageId: "m1", content: "Running the build." },
+          data: { messageId: COPILOT_MESSAGE_ID, content: "Running the build." },
         },
         {
           ...event,
@@ -395,6 +473,13 @@ describe("CopilotSdkAdapterV2", () => {
       const items = turnItems(yield* harness.untilTerminal());
 
       const messages = items.filter((item) => item.type === "assistant_message");
+      // Ids come from Copilot's session and message ids, not T3's nested derived ids. A UUID
+      // session gives 126 characters; AssistantCitation caps message ids at 512.
+      for (const message of messages) {
+        if (message.type !== "assistant_message") continue;
+        assert.isAtMost(message.messageId.length, 160);
+        assert.notInclude(message.messageId, "run-attempt");
+      }
       assert.deepStrictEqual(
         messages.map((item) => [item.text, item.streaming]),
         [
@@ -525,6 +610,144 @@ describe("CopilotSdkAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.effect("keeps the turn open until a steer's own run idles", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const harness = yield* makeHarness(fake);
+      const input = yield* turnInput(harness.providerThread);
+      yield* harness.runtime.startTurn(input);
+      const turnId = (yield* harness.takeRunningTurn()).id;
+      yield* fake.takeCall("sendAndWait");
+      yield* harness.runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: input.runId,
+        providerThread: harness.providerThread,
+        providerTurnId: turnId,
+        message: { ...input.message, messageId: MessageId.make("steer"), text: "Also run lint" },
+      });
+      // The request's run idles, then the steer starts a run of its own before the wait settles.
+      for (const sdkEvent of [
+        { ...event, type: "session.idle", ephemeral: true, data: { aborted: false } },
+        {
+          ...event,
+          type: "user.message",
+          data: { messageId: "steer-message", content: "Also run lint", delivery: "idle" },
+        },
+      ] satisfies ReadonlyArray<SessionEvent>) {
+        yield* fake.emit(sdkEvent);
+      }
+      yield* fake.finishRun();
+      // The SDK settles its promise before Copilot's next notifications arrive.
+      yield* Effect.promise(() => Promise.resolve());
+      for (const sdkEvent of [
+        {
+          ...event,
+          type: "assistant.message",
+          data: { messageId: "m-lint", content: "Lint passes" },
+        },
+        { ...event, type: "session.idle", ephemeral: true, data: { aborted: false } },
+      ] satisfies ReadonlyArray<SessionEvent>) {
+        yield* fake.emit(sdkEvent);
+      }
+      const events = yield* harness.untilTerminal();
+      assert.isTrue(
+        turnItems(events).some(
+          (item) => item.type === "assistant_message" && item.text === "Lint passes",
+        ),
+      );
+      assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("fails a steer's follow-up run on its error or on a CLI exit", () =>
+    Effect.gen(function* () {
+      for (const ending of ["error", "exit"] as const) {
+        yield* Effect.gen(function* () {
+          const fake = yield* makeFakeCopilot();
+          const harness = yield* makeHarness(fake);
+          const input = yield* turnInput(harness.providerThread);
+          yield* harness.runtime.startTurn(input);
+          const turnId = (yield* harness.takeRunningTurn()).id;
+          yield* fake.takeCall("sendAndWait");
+          yield* harness.runtime.steerTurn({
+            threadId: THREAD_ID,
+            runId: input.runId,
+            providerThread: harness.providerThread,
+            providerTurnId: turnId,
+            message: { ...input.message, messageId: MessageId.make("steer"), text: "Retry" },
+          });
+          yield* fake.finishRun();
+          yield* Effect.promise(() => Promise.resolve());
+          yield* fake.emit({
+            ...event,
+            type: "user.message",
+            data: { messageId: "steer-message", content: "Retry", delivery: "idle" },
+          });
+          if (ending === "error") {
+            yield* fake.emit({
+              ...event,
+              type: "session.error",
+              data: { errorType: "rate_limit", message: "Rate limit exceeded", statusCode: 429 },
+            });
+          } else {
+            yield* fake.exitProcess();
+          }
+          const terminal = (yield* harness.untilTerminal()).at(-1);
+          if (terminal?.type !== "turn.terminal" || terminal.status !== "failed") {
+            return assert.fail(`expected a failed turn after the follow-up ${ending}`);
+          }
+          assert.strictEqual(
+            terminal.failure.message,
+            ending === "error" ? "Rate limit exceeded" : "Copilot stopped unexpectedly.",
+          );
+          assert.strictEqual(
+            terminal.threadDisposition,
+            ending === "error" ? "reusable" : "broken",
+          );
+        }).pipe(Effect.scoped);
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("waits for Copilot's background work after an autopilot request", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      const releaseDrain = fake.holdDrain();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(
+        yield* turnInput(harness.providerThread, [
+          { id: "mode", value: "https://agentclientprotocol.com/protocol/session-modes#autopilot" },
+        ]),
+      );
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_start",
+        data: { toolCallId: "bg", toolName: "bash", arguments: { command: "pnpm test" } },
+      });
+      // Autopilot completion does not wait for attached shells.
+      yield* fake.finishRun();
+      yield* fake.takeCall("tasks.waitForPending");
+      yield* fake.emit({
+        ...event,
+        type: "tool.execution_complete",
+        data: {
+          toolCallId: "bg",
+          success: true,
+          result: { content: "ok" },
+          shellExecution: { exitCode: 0 },
+        },
+      });
+      yield* releaseDrain;
+      const events = yield* harness.untilTerminal();
+      assert.deepInclude(
+        turnItems(events).findLast((item) => item.type === "command_execution"),
+        { status: "completed", exitCode: 0 },
+      );
+      assert.deepInclude(events.at(-1), { type: "turn.terminal", status: "completed" });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("relaunches Copilot and resumes its session after the CLI exits", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeCopilot();
@@ -554,6 +777,7 @@ describe("CopilotSdkAdapterV2", () => {
     Effect.gen(function* () {
       const fake = yield* makeFakeCopilot();
       fake.hangAbort();
+      const releaseExit = fake.holdExit();
       const harness = yield* makeHarness(fake);
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
       const turnId = (yield* harness.takeRunningTurn()).id;
@@ -563,13 +787,64 @@ describe("CopilotSdkAdapterV2", () => {
         .pipe(Effect.forkScoped);
       yield* fake.takeCall("abort");
       yield* TestClock.adjust("30 seconds");
+      // forceStop has rejected the request; the process has not exited yet.
       yield* fake.takeCall("forceStop");
+      yield* releaseExit;
       yield* Fiber.join(interrupting);
       assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
         type: "turn.terminal",
         status: "interrupted",
         threadDisposition: "broken",
       });
+      yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
+      assert.strictEqual(fake.launches.length, 2);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("kills Copilot's process tree on Windows and reports a failed kill", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeCopilot();
+      fake.hangAbort();
+      const spawned: Array<ReadonlyArray<string>> = [];
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.sync(() => {
+          if ("args" in command) spawned.push([command.command, ...command.args]);
+          return ChildProcessSpawner.makeHandle({
+            pid: ChildProcessSpawner.ProcessId(1),
+            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+            isRunning: Effect.succeed(false),
+            kill: () => Effect.void,
+            unref: Effect.succeed(Effect.void),
+            stdin: Sink.drain,
+            stdout: Stream.empty,
+            stderr: Stream.empty,
+            all: Stream.empty,
+            getInputFd: () => Sink.drain,
+            getOutputFd: () => Stream.empty,
+          });
+        }),
+      );
+      const harness = yield* makeHarness(fake, undefined, {
+        COPILOT_CLI_PATH: "C:\\tools\\copilot.exe",
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      );
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
+      const turnId = (yield* harness.takeRunningTurn()).id;
+      yield* fake.takeCall("sendAndWait");
+      yield* harness.runtime
+        .interruptTurn({ providerThread: harness.providerThread, providerTurnId: turnId })
+        .pipe(Effect.forkScoped);
+      yield* fake.takeCall("abort");
+      yield* TestClock.adjust("30 seconds");
+      yield* fake.takeCall("forceStop");
+      assert.deepStrictEqual(spawned, [["taskkill", "/PID", "4242", "/T", "/F"]]);
+      yield* harness.takeEvent(
+        (item) =>
+          item.type === "provider_session.updated" &&
+          (item.providerSession.lastError ?? "").includes("taskkill exited 1"),
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -616,6 +891,35 @@ describe("CopilotSdkAdapterV2", () => {
       assert.deepStrictEqual((yield* fake.takeCall("model.switchTo")).args, [
         { modelId: "claude-sonnet-4.5", reasoningEffort: null },
       ]);
+      yield* fake.takeCall("sendAndWait");
+      yield* fake.finishRun();
+      yield* harness.untilTerminal();
+      // Copilot asks for compaction instead of switching: the turn must not run on the old model.
+      fake.queueSwitchResult({
+        confirmation: {
+          targetModelDisplayName: "GPT-5.5",
+          currentTokens: 180000,
+          targetLimit: 128000,
+        },
+      });
+      const smaller = yield* turnInput(harness.providerThread, [], 3);
+      const gpt = { ...smaller, modelSelection: { ...smaller.modelSelection, model: "gpt-5.5" } };
+      assert.strictEqual(
+        (yield* harness.runtime.startTurn(gpt).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* harness.runtime.startTurn({ ...gpt, providerTurnOrdinal: 4 });
+      assert.deepStrictEqual(
+        [
+          (yield* fake.takeCall("model.switchTo")).args,
+          (yield* fake.takeCall("model.switchTo")).args,
+        ],
+        [
+          [{ modelId: "gpt-5.5", reasoningEffort: null }],
+          [{ modelId: "gpt-5.5", reasoningEffort: null }],
+        ],
+      );
+      yield* fake.takeCall("sendAndWait");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -848,6 +1152,12 @@ describe("CopilotSdkAdapterV2", () => {
             summaryContent: "Summary",
           },
         },
+        // Copilot exits mid-compaction: its item must not stay running.
+        {
+          ...event,
+          type: "session.compaction_start",
+          data: { compactionAttemptId: "c2", currentTokens: 30000 },
+        },
       ] satisfies ReadonlyArray<SessionEvent>) {
         yield* fake.emit(sdkEvent);
       }
@@ -886,8 +1196,11 @@ describe("CopilotSdkAdapterV2", () => {
         [
           ["running", 150000, undefined],
           ["completed", 150000, 20000],
+          ["running", 30000, undefined],
+          ["failed", 30000, undefined],
         ],
       );
+      assert.strictEqual(compaction.at(-1)?.title, "Context compaction failed");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -961,8 +1274,9 @@ describe("CopilotSdkAdapterV2", () => {
       if (shown.type !== "runtime_request.updated") return assert.fail("no request");
       assert.deepInclude(shown.runtimeRequest, { kind: "command", status: "pending" });
       assert.strictEqual(shown.runtimeRequest.nativeRequestRef?.nativeId, "perm-shell");
+      const shell = shown.runtimeRequest.id;
       yield* harness.runtime.respondToRuntimeRequest({
-        requestId: shown.runtimeRequest.id,
+        requestId: shell,
         decision: "acceptForSession",
       });
       assert.deepStrictEqual(
@@ -983,16 +1297,38 @@ describe("CopilotSdkAdapterV2", () => {
       const answered = yield* Effect.promise(async () =>
         ask({ question: "Which one?", choices: ["A", "B"] }, { sessionId: "copilot-native-1" }),
       ).pipe(Effect.forkScoped);
-      const question = yield* harness.takeEvent(
+      const afterShell = yield* harness.until(
         (item) =>
           item.type === "runtime_request.updated" && item.runtimeRequest.kind === "user_input",
       );
-      if (question.type !== "runtime_request.updated") return assert.fail("no question");
+      const question = afterShell.at(-1);
+      if (question?.type !== "runtime_request.updated") return assert.fail("no question");
       yield* harness.runtime.respondToRuntimeRequest({
         requestId: question.runtimeRequest.id,
         answers: { answer: "B" },
       });
       assert.deepStrictEqual(yield* Fiber.join(answered), { answer: "B", wasFreeform: false });
+      // T3 persisted both answers (decision, questionAnswer); republishing would overwrite them.
+      yield* fake.emit({
+        ...event,
+        type: "assistant.message",
+        data: { messageId: "after-requests", content: "Done" },
+      });
+      const after = yield* harness.until(
+        (item) => item.type === "turn_item.updated" && item.turnItem.type === "assistant_message",
+      );
+      const answeredIds = new Set<string>([shell, question.runtimeRequest.id]);
+      const republished = [...afterShell, ...after].filter(
+        (item) =>
+          (item.type === "runtime_request.updated" &&
+            answeredIds.has(item.runtimeRequest.id) &&
+            item.runtimeRequest.status !== "pending") ||
+          (item.type === "turn_item.updated" &&
+            (item.turnItem.type === "approval_request" ||
+              item.turnItem.type === "user_input_request") &&
+            item.turnItem.status !== "waiting"),
+      );
+      assert.deepStrictEqual(republished, []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });
