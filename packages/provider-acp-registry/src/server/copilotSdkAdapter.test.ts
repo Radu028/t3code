@@ -30,6 +30,7 @@ import * as Effect from "effect/Effect";
 import * as Predicate from "effect/Predicate";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Sink from "effect/Sink";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -1548,17 +1549,19 @@ describe("CopilotSdkAdapterV2", () => {
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread));
       const turnId = (yield* harness.takeRunningTurn()).id;
       yield* fake.takeCall("sendAndWait");
+      // The session manager abandons an interrupt after 15 seconds; the kill must start before
+      // then, and finish even though the call it came from was cut short.
       const interrupting = yield* harness.runtime
         .interruptTurn({ providerThread: harness.providerThread, providerTurnId: turnId })
-        .pipe(Effect.forkScoped);
+        .pipe(Effect.timeoutOption("15 seconds"), Effect.forkScoped);
       yield* fake.takeCall("abort");
-      yield* TestClock.adjust("30 seconds");
+      yield* TestClock.adjust("15 seconds");
       // The SDK's SIGKILL reaches only the CLI, so its shells and agents go first.
       assert.deepInclude(yield* fake.nextCall, { method: "killDescendants" });
       // forceStop has rejected the request; the process has not exited yet.
       assert.deepInclude(yield* fake.nextCall, { method: "forceStop" });
+      assert.isTrue(Option.isNone(yield* Fiber.join(interrupting)));
       yield* releaseExit;
-      yield* Fiber.join(interrupting);
       assert.deepInclude((yield* harness.untilTerminal()).at(-1), {
         type: "turn.terminal",
         status: "interrupted",

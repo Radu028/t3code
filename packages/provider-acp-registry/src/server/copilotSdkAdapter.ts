@@ -92,7 +92,8 @@ const DRIVER = ProviderDriverKind.make("acpRegistry");
 
 /** Node's setTimeout ceiling: a turn ends on Copilot's completion, never on a timer. */
 const TURN_COMPLETION_TIMEOUT_MS = 2_147_483_647;
-const INTERRUPT_CONFIRMATION_TIMEOUT: Duration.Input = "30 seconds";
+// Well inside the session manager's 15-second interrupt deadline, so the kill starts in time.
+const INTERRUPT_CONFIRMATION_TIMEOUT: Duration.Input = "8 seconds";
 // T3 runs a thread's effects one at a time, so a Stop queued behind an RPC waits for it. The
 // turn's own request and /compact are Copilot's work, not an answer, and stay unbounded.
 const RPC_TIMEOUT: Duration.Input = "30 seconds";
@@ -2941,7 +2942,10 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             );
             if (Option.isSome(confirmed)) return;
             // T3 checkpoints files after an interrupted turn, so the CLI must stop writing first.
-            yield* killTurn(turn, "interrupted");
+            // The session manager abandons an interrupt after 15 seconds, so the kill runs on its
+            // own and still ends the turn if this call is cut short.
+            yield* killTurn(turn, "interrupted").pipe(Effect.forkIn(sessionScope));
+            yield* Deferred.await(turn.done);
           },
           (effect, args) =>
             effect.pipe(
