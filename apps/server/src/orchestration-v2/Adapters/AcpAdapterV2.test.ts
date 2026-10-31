@@ -471,7 +471,7 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
     | ((event: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>)
     | undefined;
   let duringNextPreparation: Effect.Effect<void, EffectAcpErrors.AcpError> = Effect.void;
-  let reportNextPromptCancelled = false;
+  let nextPromptStopReason: "cancelled" | "refusal" | "error" | undefined;
   const adapter = yield* makeAcpAdapterV2({
     instanceId,
     flavor: {
@@ -512,9 +512,10 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
               Effect.tap(() => runtime.drainEvents),
               // Grok's local cancel reports `cancelled` even when the agent never saw the prompt.
               Effect.map((result) => {
-                if (!reportNextPromptCancelled) return result;
-                reportNextPromptCancelled = false;
-                return { ...result, stopReason: "cancelled" as const };
+                if (nextPromptStopReason === undefined) return result;
+                const stopReason = nextPromptStopReason;
+                nextPromptStopReason = undefined;
+                return { ...result, stopReason };
               }),
             ),
         }),
@@ -567,9 +568,10 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
       assert.isDefined(sessionUpdate);
       yield* sessionUpdate({ sessionId, update });
     }),
-    reportNextPromptCancelled: Effect.sync(() => {
-      reportNextPromptCancelled = true;
-    }),
+    reportNextPromptStopped: (stopReason: "cancelled" | "refusal" | "error") =>
+      Effect.sync(() => {
+        nextPromptStopReason = stopReason;
+      }),
     sessionUpdateDuringNextPreparation: (update: EffectAcpSchema.SessionUpdate) =>
       Effect.sync(() => {
         duringNextPreparation = Effect.suspend(() => {
@@ -1914,22 +1916,28 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
-  it.live(
-    "reinjects ACP instructions after protocol compaction, during reinjection, prompt preparation, or while idle",
-    () =>
+  it.live.each(["cancelled", "refusal", "error"] as const)(
+    "reinjects ACP instructions after protocol compaction, during reinjection, prompt preparation, or while idle (%s)",
+    (stopReason) =>
       Effect.gen(function* () {
         const {
           runTurn,
           idleSessionUpdate,
           idleCopilotSessionEvent,
           sessionUpdateDuringNextPreparation,
-          reportNextPromptCancelled,
+          reportNextPromptStopped,
         } = yield* makeInstructionCompactionHarness({
           T3_ACP_COMPACTION_PROMPT_ORDINALS: "2,4",
           T3_ACP_OPEN_COMPACTION_PROMPT_ORDINALS: "13",
         });
-        yield* reportNextPromptCancelled;
-        assertReinjectedInstructions(yield* runTurn("Start work.", "cancelled"), "Start work.");
+        const expectedStatus =
+          stopReason === "error"
+            ? "failed"
+            : stopReason === "cancelled"
+              ? "cancelled"
+              : "completed";
+        yield* reportNextPromptStopped(stopReason);
+        assertReinjectedInstructions(yield* runTurn("Start work.", expectedStatus), "Start work.");
         assertReinjectedInstructions(
           yield* runTurn("Continue until context compacts."),
           "Continue until context compacts.",
@@ -2026,16 +2034,16 @@ describe("AcpAdapterV2", () => {
         ]);
         yield* idleSessionUpdate({
           sessionUpdate: "compaction_update",
-          compactionId: "compact-before-local-cancel",
+          compactionId: "compact-before-undelivered-prompt",
           status: "completed",
         });
-        yield* reportNextPromptCancelled;
+        yield* reportNextPromptStopped(stopReason);
         assertReinjectedInstructions(
-          yield* runTurn("Stop before the agent sees this.", "cancelled"),
-          "Stop before the agent sees this.",
+          yield* runTurn("Do not retain this prompt.", expectedStatus),
+          "Do not retain this prompt.",
         );
         assertReinjectedInstructions(
-          yield* runTurn("Continue after the local cancel."),
+          yield* runTurn("Continue after the undelivered prompt."),
           "Continue after the local cancel.",
         );
       }).pipe(Effect.provide(layerTest), Effect.scoped),

@@ -7745,8 +7745,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   Effect.gen(function* () {
                     // Record delivery only for the current runtime, since a replacement can
                     // reuse this session id. A cancelled prompt may never have reached the
-                    // agent (Grok cancels locally), so the next prompt resends the notes.
-                    if (result.stopReason !== "cancelled") {
+                    // agent (Grok cancels locally); refusals discard it and errors need a retry.
+                    if (
+                      result.stopReason !== "cancelled" &&
+                      result.stopReason !== "refusal" &&
+                      result.stopReason !== "error"
+                    ) {
                       yield* Ref.update(promptInstructionStates, (current) => {
                         if (promptParts?.instructionState === undefined) return current;
                         const updated = new Map(current);
