@@ -446,6 +446,7 @@ const pollProtocolMethods = (events: Queue.Queue<EffectAcpProtocol.AcpProtocolLo
 
 const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
   environment: Readonly<Record<string, string>>,
+  prepareAttachments = false,
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
@@ -472,19 +473,24 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
     | undefined;
   let duringNextPreparation: Effect.Effect<void, EffectAcpErrors.AcpError> = Effect.void;
   let nextPromptStopReason: "cancelled" | "refusal" | "error" | undefined;
+  const prepare = Effect.suspend(() => {
+    const during = duringNextPreparation;
+    duringNextPreparation = Effect.void;
+    return during.pipe(Effect.orDie);
+  });
   const adapter = yield* makeAcpAdapterV2({
     instanceId,
     flavor: {
       driver: ACP_TEST_DRIVER,
       capabilities: AcpProviderCapabilitiesV2,
       supportsCompaction: true,
-      // Prompt preparation awaits this hook, so frames sent from it land mid-preparation.
       rewriteUserText: (text) =>
-        Effect.suspend(() => {
-          const during = duringNextPreparation;
-          duringNextPreparation = Effect.void;
-          return during.pipe(Effect.orDie, Effect.as(text));
-        }),
+        prepareAttachments ? Effect.succeed(text) : prepare.pipe(Effect.as(text)),
+      ...(prepareAttachments
+        ? {
+            buildAttachmentPrompt: () => prepare.pipe(Effect.as([])),
+          }
+        : {}),
       registerExtensions: makeCopilotSubagentRouting().registerExtensions,
       // Routes updates tagged with a Devin subagent context to that child session.
       normalizeSessionUpdate: normalizeDevinSessionUpdate,
@@ -1926,10 +1932,13 @@ describe("AcpAdapterV2", () => {
           idleCopilotSessionEvent,
           sessionUpdateDuringNextPreparation,
           reportNextPromptStopped,
-        } = yield* makeInstructionCompactionHarness({
-          T3_ACP_COMPACTION_PROMPT_ORDINALS: "2,4",
-          T3_ACP_OPEN_COMPACTION_PROMPT_ORDINALS: "13",
-        });
+        } = yield* makeInstructionCompactionHarness(
+          {
+            T3_ACP_COMPACTION_PROMPT_ORDINALS: "2,4",
+            T3_ACP_OPEN_COMPACTION_PROMPT_ORDINALS: "13",
+          },
+          stopReason === "error",
+        );
         const expectedStatus =
           stopReason === "error"
             ? "failed"
@@ -1943,7 +1952,7 @@ describe("AcpAdapterV2", () => {
           "Continue until context compacts.",
         );
         assert.deepEqual(yield* runTurn("  /repro-skill"), [
-          { type: "text", text: "  /repro-skill" },
+          { type: "text", text: stopReason === "error" ? "/repro-skill" : "  /repro-skill" },
         ]);
         assertReinjectedInstructions(
           yield* runTurn("Continue after compaction."),
@@ -2044,7 +2053,7 @@ describe("AcpAdapterV2", () => {
         );
         assertReinjectedInstructions(
           yield* runTurn("Continue after the undelivered prompt."),
-          "Continue after the local cancel.",
+          "Continue after the undelivered prompt.",
         );
       }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
