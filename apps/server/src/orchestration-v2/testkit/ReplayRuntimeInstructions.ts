@@ -83,7 +83,7 @@ export function materializeReplayTranscriptRuntimeInstructions(
         // Like the adapter, native slash commands go out without instructions.
         if (promptPartText(prompt[0])?.trimStart().startsWith("/") === true) return entry;
         pendingInstructedPrompt = { sessionId: promptSessionId };
-        if (promptPartText(prompt.at(-1)) === instructions) return entry;
+        if (promptPartText(prompt.at(-1))?.startsWith("<runtime_info>") === true) return entry;
         return {
           ...entry,
           frame: {
