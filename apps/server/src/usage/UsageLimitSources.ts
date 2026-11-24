@@ -242,22 +242,23 @@ export const make = Effect.gen(function* () {
     );
   }).pipe(Effect.ignoreCause({ log: true }));
 
-  // A caller may stop waiting, as the reset fallback does after five seconds. While queued it
-  // just leaves the queue. Once its refresh has the lock, the refresh runs to its end in the
+  // A caller may stop waiting, as the reset fallback does after five seconds. A refresh still
+  // queued for the lock is then dropped. One that is already reading runs to its end in the
   // service's scope, so a refusal it met still reaches the shown state.
   const scope = yield* Effect.scope;
-  const refresh = Effect.uninterruptibleMask((restore) =>
-    restore(refreshLock.take(1)).pipe(
-      Effect.andThen(
-        readAll.pipe(
-          Effect.interruptible,
-          Effect.ensuring(refreshLock.release(1)),
-          Effect.forkIn(scope),
+  const refresh = Effect.suspend(() => {
+    let reading = false;
+    const read = Effect.sync(() => {
+      reading = true;
+    }).pipe(Effect.andThen(readAll), refreshLock.withPermits(1), Effect.interruptible);
+    return Effect.uninterruptibleMask((restore) =>
+      Effect.flatMap(Effect.forkIn(read, scope), (fiber) =>
+        restore(Fiber.join(fiber)).pipe(
+          Effect.onInterrupt(() => (reading ? Effect.void : Fiber.interrupt(fiber))),
         ),
       ),
-      Effect.flatMap((fiber) => restore(Fiber.join(fiber))),
-    ),
-  );
+    );
+  });
 
   // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
   const consumeResetCredit = Effect.fn("UsageLimitSources.consumeResetCredit")(function* (

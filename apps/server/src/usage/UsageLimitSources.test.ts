@@ -181,6 +181,7 @@ it.effect(
   () => {
     let refused = false;
     let stalled: Effect.Effect<void> = Effect.void;
+    let listings = 0;
     let workspace = "account-a";
     let listsIdentity = true;
     const unreadable = { windows: [], unavailable: { reason: "probeFailed" } };
@@ -211,12 +212,18 @@ it.effect(
           lastReadAt: "2026-11-24T09:00:00.000Z",
         },
       });
-      // A caller that stops waiting does not stop the refresh, whose answer is still shown.
+      // A caller that stops waiting does not stop a refresh that is reading, whose answer is still
+      // shown. One still queued behind it is dropped and asks the hub nothing.
+      const queuedRefresh = yield* Effect.forkChild(sources.refresh);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(queuedRefresh);
       yield* Fiber.interrupt(slowRefresh);
+      const listed = listings;
       stalled = Effect.void;
       yield* Deferred.succeed(hubAnswers, undefined);
       yield* TestClock.adjust("1 second");
       expect((yield* shown)?.checkedAt).toBe("2026-11-24T09:00:30.000Z");
+      expect(listings).toBe(listed);
       // Later failures keep naming the last real read and never bring the reading back.
       yield* TestClock.adjust("2 minutes");
       expect(yield* read).toMatchObject({
@@ -280,6 +287,7 @@ it.effect(
                     ],
                   }),
                 );
+                listings += 1;
                 return Effect.as(stalled, listing);
               }
               const usage = {

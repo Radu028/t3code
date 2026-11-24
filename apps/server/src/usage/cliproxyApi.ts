@@ -165,7 +165,7 @@ function upstreamRetryAt(response: typeof ApiResponse.Type, now: number): number
     ? Number(text) * 1_000
     : // Date.parse also accepts bare numbers and partial dates; an HTTP-date starts with a day name.
       // Its asctime form names no zone and means UTC, where Date.parse would assume local time.
-      /^[a-z]{3}/i.test(text)
+      /^(mon|tue|wed|thu|fri|sat|sun)/i.test(text)
       ? Date.parse(/\bGMT$/i.test(text) ? text : `${text} GMT`) - now
       : Number.NaN;
   // A delay too long for a number is still a delay, and takes the cap.
