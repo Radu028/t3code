@@ -539,7 +539,9 @@ export const makeCliproxyApi = Effect.gen(function* () {
     account: AuthFile,
     provider: HubProvider,
   ) {
-    const checkedAt = DateTime.formatIso(yield* DateTime.now);
+    const now = yield* DateTime.now;
+    const startedAt = DateTime.toEpochMillis(now);
+    const checkedAt = DateTime.formatIso(now);
     const login = listedIdentity(account);
     // Messages are credential-free: a status code or a fixed sentence.
     const unreadable = (message: string, retryAt?: number) => ({
@@ -578,9 +580,10 @@ export const makeCliproxyApi = Effect.gen(function* () {
       Effect.catch((error) =>
         Effect.sync(() => {
           if (isHubUpstreamRefusal(error)) {
-            if (error.retryAt === undefined) return unreadable(error.message);
-            // Two sources may name one hub; the read that answers last must not shorten the wait.
-            const until = Math.max(error.retryAt, cooldowns.get(cooldownKey)?.until ?? 0);
+            // Two sources may name one hub. The read that answers last must not shorten the wait
+            // or report none while one is still enforced.
+            const until = Math.max(error.retryAt ?? 0, cooldowns.get(cooldownKey)?.until ?? 0);
+            if (until <= startedAt) return unreadable(error.message);
             cooldowns.set(cooldownKey, { until, status: error.status });
             return unreadable(error.message, until);
           }
