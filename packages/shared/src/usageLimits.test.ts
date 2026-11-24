@@ -2086,6 +2086,21 @@ describe("external usage settings", () => {
       "a@example.com · K12 · nucbox-k12, Laptop · last read 09:12",
     );
 
+    // An environment that was told no wait can read now, so the row counts nothing down.
+    expect(
+      collectLimitNotices(
+        new Map([
+          [
+            EnvironmentId.make("a"),
+            reads("nucbox-k12", shared, [
+              failed("a@example.com", { retryAt: "2026-09-03T12:01:20.000Z" }),
+            ]),
+          ],
+          [EnvironmentId.make("b"), reads("Laptop", shared, [failed("a@example.com")])],
+        ]),
+      )[0]?.rows[0]?.retryAt,
+    ).toBeUndefined();
+
     // Each machine's own localhost hub holds its own logins, whatever their names.
     const local = "http://127.0.0.1:8317";
     expect(

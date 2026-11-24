@@ -225,7 +225,7 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const refresh = Effect.gen(function* () {
+  const readAll = Effect.gen(function* () {
     const settings = yield* settingsService.getSettings.pipe(
       Effect.orElseSucceed((): ServerSettings | null => null),
     );
@@ -237,12 +237,27 @@ export const make = Effect.gen(function* () {
       ([id, config]) => readSource(id as UsageLimitSourceId, config),
       { concurrency: 4 },
     );
-    // Uninterruptible, so a caller's timeout cannot leave a kept reading without its timer.
     yield* changeShown(Effect.andThen(Ref.set(readRef, snapshots), publishRead)).pipe(
       Effect.flatMap(expireKeptReadings),
-      Effect.uninterruptible,
     );
-  }).pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
+  }).pipe(Effect.ignoreCause({ log: true }));
+
+  // A caller may stop waiting, as the reset fallback does after five seconds. While queued it
+  // just leaves the queue. Once its refresh has the lock, the refresh runs to its end in the
+  // service's scope, so a refusal it met still reaches the shown state.
+  const scope = yield* Effect.scope;
+  const refresh = Effect.uninterruptibleMask((restore) =>
+    restore(refreshLock.take(1)).pipe(
+      Effect.andThen(
+        readAll.pipe(
+          Effect.interruptible,
+          Effect.ensuring(refreshLock.release(1)),
+          Effect.forkIn(scope),
+        ),
+      ),
+      Effect.flatMap((fiber) => restore(Fiber.join(fiber))),
+    ),
+  );
 
   // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
   const consumeResetCredit = Effect.fn("UsageLimitSources.consumeResetCredit")(function* (
@@ -308,13 +323,10 @@ export const make = Effect.gen(function* () {
 
   yield* refresh.pipe(Effect.forkScoped);
 
-  const scope = yield* Effect.scope;
   return {
     current: Ref.get(stateRef),
     consumeResetCredit,
-    // A caller may stop waiting, as the reset fallback does after five seconds. The refresh still
-    // runs to its end, so a refusal it met reaches the shown state.
-    refresh: refresh.pipe(Effect.forkIn(scope), Effect.flatMap(Fiber.join)),
+    refresh,
     get streamChanges() {
       return Stream.unwrap(
         Effect.gen(function* () {

@@ -555,7 +555,12 @@ export const makeCliproxyApi = Effect.gen(function* () {
       }),
     });
     // An auth file can be given another login, which the provider has not told to wait.
-    const cooldownKey = [hubKey, account.auth_index, login.email, login.workspaceId].join("\n");
+    const cooldownKey = [
+      hubKey,
+      account.auth_index,
+      login.email?.toLowerCase(),
+      login.workspaceId,
+    ].join("\n");
     // Every upstream request of a read passes here, so a read already under way also stops once
     // another read of the same login is told to wait.
     const call: HubCall = (url, data) =>

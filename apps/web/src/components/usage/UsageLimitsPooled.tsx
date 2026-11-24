@@ -27,6 +27,7 @@ import {
 } from "react";
 
 import { ensureLocalApi } from "../../localApi";
+import { useDeadlinePassed } from "../../hooks/useDeadline";
 import { usePrimarySettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { tickTextContent } from "../../lib/tickTextContent";
@@ -779,6 +780,8 @@ function LimitNotices({ notices }: { readonly notices: readonly LimitNotice[] })
 function LimitNoticeRowItem({ row }: { readonly row: LimitNoticeRow }) {
   const m = useMessages();
   const timestampFormat = usePrimarySettings((settings) => settings.timestampFormat);
+  // Re-renders when the wait ends, which stops the tick.
+  const waitOver = useDeadlinePassed(row.retryAt === undefined ? null : Date.parse(row.retryAt));
   return (
     <li
       ref={tickTextContent(
@@ -789,7 +792,7 @@ function LimitNoticeRowItem({ row }: { readonly row: LimitNoticeRow }) {
             (isoDate) => formatDayAwareTimestamp(isoDate, timestampFormat, nowMs, undefined, m),
             m,
           ),
-        row.retryAt !== undefined,
+        row.retryAt !== undefined && !waitOver,
       )}
     />
   );

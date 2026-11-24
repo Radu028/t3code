@@ -460,7 +460,7 @@ export interface FailedHubAccount {
   readonly environments: readonly string[];
   /** The newest failed report, which supplies the reason. */
   readonly limits: ServerProviderUsageLimits;
-  /** When the first reporting environment may read again; a refresh after it sends a read. */
+  /** When the first reporting environment may read again; absent when one already may. */
   readonly retryAt: string | undefined;
   readonly lastReadAt: string | undefined;
 }
@@ -488,10 +488,10 @@ export function unshownFailedHubAccounts(
       }
     }
   }
-  const pick = (order: "earlier" | "later", left: string | undefined, right: string | undefined) =>
+  const later = (left: string | undefined, right: string | undefined) =>
     left === undefined || right === undefined
       ? (left ?? right)
-      : Date.parse(left) > Date.parse(right) === (order === "later")
+      : Date.parse(left) > Date.parse(right)
         ? left
         : right;
   const failed = new Map<string, FailedHubAccount>();
@@ -519,8 +519,16 @@ export function unshownFailedHubAccounts(
             ? previous.environments
             : [...(previous?.environments ?? []), environment],
           limits: newer ? account.usageLimits : previous.limits,
-          retryAt: pick("earlier", previous?.retryAt, failure.retryAt),
-          lastReadAt: pick("later", previous?.lastReadAt, failure.lastReadAt),
+          // An environment that was told no wait can read now, so the row has none either.
+          retryAt:
+            previous === undefined
+              ? failure.retryAt
+              : previous.retryAt === undefined || failure.retryAt === undefined
+                ? undefined
+                : Date.parse(failure.retryAt) < Date.parse(previous.retryAt)
+                  ? failure.retryAt
+                  : previous.retryAt,
+          lastReadAt: later(previous?.lastReadAt, failure.lastReadAt),
         });
       }
     }
