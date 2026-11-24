@@ -12805,5 +12805,8 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Cancel stack auto-merge",
-  "012c67c7f1a99e33": "Auto-merge stack"
+  "012c67c7f1a99e33": "Auto-merge stack",
+  "0f606a79a0cd6084": "can retry in {duration}",
+  "60ae4604597d789b": "last read {time}",
+  "6ee8e716f6b1f298": "{provider} limits unavailable: {reason}"
 }

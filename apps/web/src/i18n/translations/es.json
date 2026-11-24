@@ -12791,5 +12791,8 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Cancelar la fusión automática de la pila",
-  "012c67c7f1a99e33": "Fusión automática de la pila"
+  "012c67c7f1a99e33": "Fusión automática de la pila",
+  "0f606a79a0cd6084": "reintento posible en {duration}",
+  "60ae4604597d789b": "última lectura {time}",
+  "6ee8e716f6b1f298": "Límites de {provider} no disponibles: {reason}"
 }

@@ -12796,5 +12796,8 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Cancelar merge automático da pilha",
-  "012c67c7f1a99e33": "Merge automático da pilha"
+  "012c67c7f1a99e33": "Merge automático da pilha",
+  "0f606a79a0cd6084": "nova tentativa possível em {duration}",
+  "60ae4604597d789b": "última leitura {time}",
+  "6ee8e716f6b1f298": "Limites de {provider} indisponíveis: {reason}"
 }

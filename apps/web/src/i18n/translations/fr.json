@@ -12796,5 +12796,8 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Annuler la fusion automatique de la pile",
-  "012c67c7f1a99e33": "Fusion automatique de la pile"
+  "012c67c7f1a99e33": "Fusion automatique de la pile",
+  "0f606a79a0cd6084": "nouvel essai possible dans {duration}",
+  "60ae4604597d789b": "dernière lecture {time}",
+  "6ee8e716f6b1f298": "Limites {provider} indisponibles : {reason}"
 }

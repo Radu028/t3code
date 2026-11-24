@@ -26,7 +26,7 @@ import {
   usesChatGptSharing,
   resolveNewThreadModelSelection,
 } from "./usageLimits.ts";
-import { collectLimitNotices } from "./usageLimitsCopy.ts";
+import { collectLimitNotices, limitNoticeRowText } from "./usageLimitsCopy.ts";
 
 const now = Date.parse("2026-09-03T12:00:00.000Z");
 
@@ -1886,7 +1886,9 @@ describe("external usage settings", () => {
       [EnvironmentId.make("b"), host],
       [EnvironmentId.make("c"), host],
     ]);
-    expect(collectLimitNotices(presentations)).toEqual(["Host · codex: Could not read limits."]);
+    expect(collectLimitNotices(presentations)).toEqual([
+      { text: "Host · codex: Could not read limits.", rows: [] },
+    ]);
   });
 
   it("shows the reason an account's limits are unsupported, but not a bare unsupported", () => {
@@ -1908,7 +1910,7 @@ describe("external usage settings", () => {
         ]),
       );
     expect(notices(unsupported("Sign in with Google to see Antigravity limits."))).toEqual([
-      "codex: Sign in with Google to see Antigravity limits.",
+      { text: "codex: Sign in with Google to see Antigravity limits.", rows: [] },
     ]);
     expect(notices(unsupported())).toEqual([]);
   });
@@ -1948,8 +1950,9 @@ describe("external usage settings", () => {
       ],
     });
     const desktop = { entry: { target: { label: "Desktop" } }, serverConfig: hub([failed]) };
-    expect(collectLimitNotices(new Map([[EnvironmentId.make("a"), desktop]]))).toEqual([
-      "hub · tg@example.com: The provider refused the hub request (HTTP 429).",
+    const refused = "Claude limits unavailable: The provider refused the hub request (HTTP 429).";
+    expect(collectLimitNotices(new Map([[EnvironmentId.make("a"), desktop]]))).toMatchObject([
+      { text: refused, rows: [{ label: "tg@example.com · hub" }] },
     ]);
     expect(
       collectLimitNotices(
@@ -1990,9 +1993,109 @@ describe("external usage settings", () => {
           ],
         ]),
       ),
-    ).toEqual([
-      "Desktop · hub · claude-tg@example.com: The provider refused the hub request (HTTP 429).",
+    ).toMatchObject([
+      { text: refused, rows: [{ label: "claude-tg@example.com · hub · Desktop" }] },
     ]);
+  });
+
+  it("lists a failed hub account once, with every environment that reads the hub", () => {
+    const checkedAt = "2026-09-03T11:00:00.000Z";
+    const failed = (email: string, unavailable: object = {}): UsageLimitSourceAccount => ({
+      id: `${email}.json`,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      email,
+      usageLimits: {
+        checkedAt,
+        windows: [],
+        unavailable: {
+          reason: "probeFailed",
+          message: "The provider refused the hub request (HTTP 429).",
+          ...unavailable,
+        },
+      },
+    });
+    const reads = (
+      label: string,
+      endpoint: string,
+      accounts: readonly UsageLimitSourceAccount[],
+    ) => ({
+      entry: { target: { label } },
+      serverConfig: {
+        providers: [],
+        usageLimitSources: [
+          {
+            // Source ids are each environment's own; the endpoint names the hub.
+            id: UsageLimitSourceId.make(`hub-on-${label}`),
+            kind: "cliproxy" as const,
+            label: "K12",
+            endpoint,
+            checkedAt,
+            accounts,
+          },
+        ],
+      },
+    });
+    const shared = "https://k12.example.com:8317";
+    const notices = collectLimitNotices(
+      new Map([
+        [
+          EnvironmentId.make("a"),
+          reads("nucbox-k12", shared, [
+            failed("a@example.com", {
+              retryAt: "2026-09-03T12:01:20.000Z",
+              lastReadAt: "2026-09-03T09:12:00.000Z",
+            }),
+            failed("b@example.com"),
+          ]),
+        ],
+        [
+          EnvironmentId.make("b"),
+          reads("Laptop", shared, [
+            failed("a@example.com", { retryAt: "2026-09-03T12:01:40.000Z" }),
+            failed("b@example.com"),
+          ]),
+        ],
+      ]),
+    );
+    expect(notices).toEqual([
+      {
+        text: "Claude limits unavailable: The provider refused the hub request (HTTP 429).",
+        rows: [
+          {
+            key: expect.any(String),
+            label: "a@example.com · K12 · nucbox-k12, Laptop",
+            retryAt: "2026-09-03T12:01:20.000Z",
+            lastReadAt: "2026-09-03T09:12:00.000Z",
+          },
+          {
+            key: expect.any(String),
+            label: "b@example.com · K12 · nucbox-k12, Laptop",
+            retryAt: undefined,
+            lastReadAt: undefined,
+          },
+        ],
+      },
+    ]);
+    const clock = (isoDate: string) => isoDate.slice(11, 16);
+    expect(notices[0]?.rows.map((row) => limitNoticeRowText(row, now, clock))).toEqual([
+      "a@example.com · K12 · nucbox-k12, Laptop · can retry in 1m 20s · last read 09:12",
+      "b@example.com · K12 · nucbox-k12, Laptop",
+    ]);
+    // Once the first environment may read again, a refresh can, so nothing is left to count down.
+    expect(limitNoticeRowText(notices[0]!.rows[0]!, now + 5 * 60_000, clock)).toBe(
+      "a@example.com · K12 · nucbox-k12, Laptop · last read 09:12",
+    );
+
+    // Each machine's own localhost hub holds its own logins, whatever their names.
+    const local = "http://127.0.0.1:8317";
+    expect(
+      collectLimitNotices(
+        new Map([
+          [EnvironmentId.make("a"), reads("nucbox-k12", local, [failed("a@example.com")])],
+          [EnvironmentId.make("b"), reads("Laptop", local, [failed("a@example.com")])],
+        ]),
+      ).flatMap((notice) => notice.rows.map((row) => row.label)),
+    ).toEqual(["a@example.com · K12 · nucbox-k12", "a@example.com · K12 · Laptop"]);
   });
 });
 

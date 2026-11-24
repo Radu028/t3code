@@ -61,6 +61,10 @@ export const ServerProviderUsageLimits = Schema.Struct({
     Schema.Struct({
       reason: Schema.Literals(["unsupported", "probeFailed"]),
       message: Schema.optional(TrimmedNonEmptyString),
+      /** The provider asked for no read before this time, so none is sent until then. */
+      retryAt: Schema.optional(IsoDateTime),
+      /** When these limits were last read. */
+      lastReadAt: Schema.optional(IsoDateTime),
     }),
   ),
 });

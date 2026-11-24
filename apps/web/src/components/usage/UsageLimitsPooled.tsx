@@ -29,7 +29,8 @@ import {
 import { ensureLocalApi } from "../../localApi";
 import { usePrimarySettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
-import { formatUpcomingTimestamp } from "../../timestampFormat";
+import { tickTextContent } from "../../lib/tickTextContent";
+import { formatDayAwareTimestamp, formatUpcomingTimestamp } from "../../timestampFormat";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 import { providerClients } from "../settings/providerDriverMeta";
 import { RedactedSensitiveText } from "../settings/RedactedSensitiveText";
@@ -43,6 +44,9 @@ import {
   collectLimitNotices,
   cursorUsageWindowDetails,
   formatResetsIn,
+  type LimitNotice,
+  type LimitNoticeRow,
+  limitNoticeRowText,
   resetCreditChoices,
 } from "@t3tools/shared/usageLimitsCopy";
 
@@ -750,16 +754,43 @@ export function UsageLimitsPooled({
   );
 }
 
-function LimitNotices({ notices }: { readonly notices: readonly string[] }) {
+function LimitNotices({ notices }: { readonly notices: readonly LimitNotice[] }) {
   if (notices.length === 0) return null;
   return (
     <Alert variant="warning" controlAlignment="first-line">
       <AlertTriangleIcon />
       {notices.map((notice) => (
-        <AlertTitle key={notice} className="break-words">
-          {notice}
+        <AlertTitle key={notice.text} className="break-words">
+          {notice.text}
+          {notice.rows.length > 0 ? (
+            // The rows count down every second; the alert must not announce each tick.
+            <ul aria-live="off" className="pl-4 font-normal tabular-nums">
+              {notice.rows.map((row) => (
+                <LimitNoticeRowItem key={row.key} row={row} />
+              ))}
+            </ul>
+          ) : null}
         </AlertTitle>
       ))}
     </Alert>
+  );
+}
+
+function LimitNoticeRowItem({ row }: { readonly row: LimitNoticeRow }) {
+  const m = useMessages();
+  const timestampFormat = usePrimarySettings((settings) => settings.timestampFormat);
+  return (
+    <li
+      ref={tickTextContent(
+        (nowMs) =>
+          limitNoticeRowText(
+            row,
+            nowMs,
+            (isoDate) => formatDayAwareTimestamp(isoDate, timestampFormat, nowMs, undefined, m),
+            m,
+          ),
+        row.retryAt !== undefined,
+      )}
+    />
   );
 }

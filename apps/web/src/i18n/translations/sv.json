@@ -12803,5 +12803,8 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Avbryt automatisk merge för stacken",
-  "012c67c7f1a99e33": "Merga stacken automatiskt"
+  "012c67c7f1a99e33": "Merga stacken automatiskt",
+  "0f606a79a0cd6084": "nytt försök möjligt om {duration}",
+  "60ae4604597d789b": "senast läst {time}",
+  "6ee8e716f6b1f298": "Gränser för {provider} är inte tillgängliga: {reason}"
 }

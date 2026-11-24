@@ -12,11 +12,13 @@ import {
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import { antigravityWindowLimitsModel, hubRoutes } from "@t3tools/shared/usageLimits";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as FiberHandle from "effect/FiberHandle";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
@@ -53,24 +55,35 @@ function sourceLabel(id: string, config: UsageLimitSourceConfig): string {
   }
 }
 
+/** How long after it was read a reading may stand in for a refused read of the same account. */
+const READING_MAX_AGE_MS = 30_000;
+
 /**
- * A refused read of one account keeps its last good reading, as provider probes keep their bars
- * (see ServerProviderUsageLimits); a reading with none to keep stays listed as unreadable.
+ * Shows `read`, except that an account whose read was refused keeps the reading `shown` has for it
+ * while that reading is younger than READING_MAX_AGE_MS. Quota can change at any moment, so an
+ * older one is replaced by the failure, which then carries when the account was last read.
+ * `expiresAt` is when the first kept reading gets too old.
  */
-function keepLastGoodReadings(
-  previous: ReadonlyArray<UsageLimitSourceSnapshot>,
-  next: ReadonlyArray<UsageLimitSourceSnapshot>,
-): ReadonlyArray<UsageLimitSourceSnapshot> {
-  return next.map((source) => {
+function keepRecentReadings(
+  shown: ReadonlyArray<UsageLimitSourceSnapshot>,
+  read: ReadonlyArray<UsageLimitSourceSnapshot>,
+  now: number,
+): {
+  readonly snapshots: ReadonlyArray<UsageLimitSourceSnapshot>;
+  readonly expiresAt: number | null;
+} {
+  let expiresAt: number | null = null;
+  const snapshots = read.map((source) => {
     // Auth file names can be reused, so only the same hub and login may lend a reading.
-    const before = previous.find(
+    const before = shown.find(
       (candidate) => candidate.id === source.id && candidate.endpoint === source.endpoint,
     );
     if (!before) return source;
     return {
       ...source,
       accounts: source.accounts.map((account) => {
-        if (account.usageLimits.unavailable?.reason !== "probeFailed") return account;
+        const failure = account.usageLimits.unavailable;
+        if (failure?.reason !== "probeFailed") return account;
         // Without a listed login, a reused auth file name cannot be told apart from the old one.
         if (account.email === undefined && account.workspaceId === undefined) return account;
         const last = before.accounts.find(
@@ -82,12 +95,25 @@ function keepLastGoodReadings(
             candidate.email === account.email &&
             candidate.workspaceId === account.workspaceId,
         );
-        if (!last || last.usageLimits.unavailable) return account;
-        // Only the reading is lent; an unread model list stays unknown.
-        return { ...last, models: account.models };
+        if (!last) return account;
+        const readAt = last.usageLimits.unavailable ? null : Date.parse(last.usageLimits.checkedAt);
+        if (readAt !== null && now - readAt < READING_MAX_AGE_MS) {
+          expiresAt = Math.min(expiresAt ?? Infinity, readAt + READING_MAX_AGE_MS);
+          // Only the reading is lent; an unread model list stays unknown.
+          return { ...last, models: account.models };
+        }
+        const lastReadAt =
+          readAt === null ? last.usageLimits.unavailable?.lastReadAt : last.usageLimits.checkedAt;
+        return lastReadAt === undefined
+          ? account
+          : {
+              ...account,
+              usageLimits: { ...account.usageLimits, unavailable: { ...failure, lastReadAt } },
+            };
       }),
     };
   });
+  return { snapshots, expiresAt };
 }
 
 function missingManagementKey(config: UsageLimitSourceConfig): string {
@@ -109,6 +135,9 @@ export const make = Effect.gen(function* () {
     return settingsSecretLiteral(resolved.managementKey);
   });
   const stateRef = yield* Ref.make<ReadonlyArray<UsageLimitSourceSnapshot>>([]);
+  // What the hubs last answered, before any refused account was given its recent reading back.
+  const readRef = yield* Ref.make<ReadonlyArray<UsageLimitSourceSnapshot>>([]);
+  const expiry = yield* FiberHandle.make();
   const changes = yield* Effect.acquireRelease(
     PubSub.unbounded<ReadonlyArray<UsageLimitSourceSnapshot>>(),
     PubSub.shutdown,
@@ -157,6 +186,44 @@ export const make = Effect.gen(function* () {
 
   // Serialize refreshes so slow old-settings reads cannot resurrect removed sources after newer refreshes.
   const refreshLock = yield* Semaphore.make(1);
+
+  // Held while the shown state changes and never across a hub request, so a refresh stuck on a
+  // slow hub cannot keep a reading up past its age.
+  const publishLock = yield* Semaphore.make(1);
+  const changeShown = <A, E>(change: Effect.Effect<A, E>) =>
+    change.pipe(publishLock.withPermits(1), Effect.uninterruptible);
+
+  /**
+   * Publishes the hubs' last answers with recent readings kept, and returns when the first kept
+   * reading gets too old. Run it through `changeShown`.
+   */
+  const publishRead = Effect.gen(function* () {
+    const kept = keepRecentReadings(
+      yield* Ref.get(stateRef),
+      yield* Ref.get(readRef),
+      yield* Clock.currentTimeMillis,
+    );
+    yield* publish(kept.snapshots);
+    return kept.expiresAt;
+  });
+
+  // No refresh may come for minutes, so a kept reading is taken down by its own timer.
+  const expireKeptReadings = Effect.fn("UsageLimitSources.expireKeptReadings")(function* (
+    expiresAt: number | null,
+  ) {
+    if (expiresAt === null) return yield* FiberHandle.clear(expiry);
+    yield* FiberHandle.run(
+      expiry,
+      Effect.gen(function* () {
+        let next: number | null = expiresAt;
+        while (next !== null) {
+          yield* Effect.sleep(Math.max(0, next - (yield* Clock.currentTimeMillis)));
+          next = yield* changeShown(publishRead);
+        }
+      }),
+    );
+  });
+
   const refresh = Effect.gen(function* () {
     const settings = yield* settingsService.getSettings.pipe(
       Effect.orElseSucceed((): ServerSettings | null => null),
@@ -169,7 +236,11 @@ export const make = Effect.gen(function* () {
       ([id, config]) => readSource(id as UsageLimitSourceId, config),
       { concurrency: 4 },
     );
-    yield* publish(keepLastGoodReadings(yield* Ref.get(stateRef), snapshots));
+    // Uninterruptible, so a caller's timeout cannot leave a kept reading without its timer.
+    yield* changeShown(Effect.andThen(Ref.set(readRef, snapshots), publishRead)).pipe(
+      Effect.flatMap(expireKeptReadings),
+      Effect.uninterruptible,
+    );
   }).pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
 
   // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
@@ -196,8 +267,14 @@ export const make = Effect.gen(function* () {
     );
     // A redemption changes the reading, so a refused re-read must not bring back the one before it.
     const snapshot = yield* readSource(input.sourceId, config);
-    const previous = yield* Ref.get(stateRef);
-    yield* publish(previous.map((source) => (source.id === input.sourceId ? snapshot : source)));
+    const replace = (sources: ReadonlyArray<UsageLimitSourceSnapshot>) =>
+      sources.map((source) => (source.id === input.sourceId ? snapshot : source));
+    yield* changeShown(
+      Effect.gen(function* () {
+        yield* Ref.update(readRef, replace);
+        yield* publish(replace(yield* Ref.get(stateRef)));
+      }),
+    );
     return result;
   }, refreshLock.withPermits(1));
 

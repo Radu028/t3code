@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -175,106 +176,137 @@ it.effect("reads a management key from its secret provider", () => {
   );
 });
 
-it.effect("keeps an account's last good reading when the hub's next read of it is refused", () => {
-  let refused = true;
-  let workspace = "account-a";
-  let listsIdentity = true;
-  const readAccount = Effect.gen(function* () {
-    const sources = yield* UsageLimitSources.make;
+it.effect(
+  "shows a refused account's reading for 30 seconds after it was read, then the failure",
+  () => {
+    let refused = false;
+    let stalled: Effect.Effect<void> = Effect.void;
+    let workspace = "account-a";
+    let listsIdentity = true;
+    const unreadable = { windows: [], unavailable: { reason: "probeFailed" } };
     return Effect.gen(function* () {
-      yield* sources.refresh;
-      const [source] = yield* sources.current;
-      return source?.accounts[0]?.usageLimits;
-    });
-  });
-  return Effect.gen(function* () {
-    const read = yield* readAccount;
-    // Nothing to keep yet: the account stays listed as unreadable.
-    expect(yield* read).toMatchObject({ windows: [], unavailable: { reason: "probeFailed" } });
-    refused = false;
-    const good = yield* read;
-    expect(good?.windows.map((window) => window.usedPercent)).toEqual([78]);
-    expect(good?.unavailable).toBeUndefined();
-    refused = true;
-    expect(yield* read).toEqual(good);
-    // The same auth file now holds another login, whose reading is unknown.
-    workspace = "account-b";
-    expect(yield* read).toMatchObject({ windows: [], unavailable: { reason: "probeFailed" } });
-    // A file that lists no login cannot show whether the next one is the same.
-    listsIdentity = false;
-    refused = false;
-    yield* read;
-    refused = true;
-    expect(yield* read).toMatchObject({ windows: [], unavailable: { reason: "probeFailed" } });
-  }).pipe(
-    Effect.provide([
-      ServerSettings.layerTest({
-        usageLimitSources: {
-          [UsageLimitSourceId.make("hub")]: {
-            kind: "cliproxy",
-            url: "http://hub.test:8317",
-            managementKey: "management-secret",
-            enabled: true,
-          },
+      yield* TestClock.setTime(Date.parse("2026-11-24T09:00:00.000Z"));
+      const sources = yield* UsageLimitSources.make;
+      const shown = Effect.map(sources.current, ([source]) => source?.accounts[0]?.usageLimits);
+      const read = Effect.andThen(sources.refresh, shown);
+      const good = yield* read;
+      expect(good?.windows.map((window) => window.usedPercent)).toEqual([78]);
+      expect(good?.checkedAt).toBe("2026-11-24T09:00:00.000Z");
+      refused = true;
+      expect(yield* read).toEqual(good);
+      yield* TestClock.adjust("29 seconds");
+      // The reading comes down when it turns 30 seconds old. No refresh is needed for that, and one
+      // stuck on a slow hub does not hold it up.
+      const hubAnswers = yield* Deferred.make<void>();
+      stalled = Deferred.await(hubAnswers);
+      const slowRefresh = yield* Effect.forkChild(sources.refresh);
+      yield* TestClock.adjust("1 second");
+      expect(yield* shown).toEqual({
+        checkedAt: "2026-11-24T09:00:00.000Z",
+        windows: [],
+        unavailable: {
+          reason: "probeFailed",
+          message: "The provider refused the hub request (HTTP 429).",
+          retryAt: "2026-11-24T09:01:29.000Z",
+          lastReadAt: "2026-11-24T09:00:00.000Z",
         },
-      }),
-      Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-        shouldRunScopeWork: () => Effect.succeed(false),
-      }),
-      Layer.succeed(SecretResolver.SecretResolver, {
-        label: (provider) => Effect.succeed(provider),
-        read: (references) => Effect.succeed(references.map(() => undefined)),
-        invalidate: () => Effect.void,
-      }),
-      Layer.succeed(
-        HttpClient.HttpClient,
-        HttpClient.make((request) =>
-          Effect.sync(() => {
-            if (new URL(request.url).pathname.endsWith("/auth-files")) {
-              return HttpClientResponse.fromWeb(
-                request,
-                Response.json({
-                  files: [
-                    {
-                      id: "first.json",
-                      auth_index: "a",
-                      provider: "codex",
-                      ...(listsIdentity
-                        ? {
-                            email: "first@example.com",
-                            id_token: { chatgpt_account_id: workspace },
-                          }
-                        : {}),
-                    },
-                  ],
-                }),
-              );
-            }
-            const usage = {
-              plan_type: "pro",
-              rate_limit: {
-                secondary_window: {
-                  used_percent: 78,
-                  reset_at: 4070908800,
-                  limit_window_seconds: 604800,
+      });
+      stalled = Effect.void;
+      yield* Deferred.succeed(hubAnswers, undefined);
+      yield* Fiber.join(slowRefresh);
+      // Later failures keep naming the last real read and never bring the reading back.
+      yield* TestClock.adjust("2 minutes");
+      expect(yield* read).toMatchObject({
+        ...unreadable,
+        unavailable: { lastReadAt: "2026-11-24T09:00:00.000Z" },
+      });
+      refused = false;
+      yield* TestClock.adjust("2 minutes");
+      expect((yield* read)?.checkedAt).toBe("2026-11-24T09:04:30.000Z");
+      refused = true;
+      // The same auth file now holds another login, whose reading is unknown.
+      workspace = "account-b";
+      expect(yield* read).toMatchObject(unreadable);
+      expect((yield* shown)?.unavailable?.lastReadAt).toBeUndefined();
+      // A file that lists no login cannot show whether the next one is the same.
+      listsIdentity = false;
+      refused = false;
+      expect((yield* read)?.unavailable).toBeUndefined();
+      refused = true;
+      expect(yield* read).toMatchObject(unreadable);
+    }).pipe(
+      Effect.provide([
+        ServerSettings.layerTest({
+          usageLimitSources: {
+            [UsageLimitSourceId.make("hub")]: {
+              kind: "cliproxy",
+              url: "http://hub.test:8317",
+              managementKey: "management-secret",
+              enabled: true,
+            },
+          },
+        }),
+        Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+          shouldRunScopeWork: () => Effect.succeed(false),
+        }),
+        Layer.succeed(SecretResolver.SecretResolver, {
+          label: (provider) => Effect.succeed(provider),
+          read: (references) => Effect.succeed(references.map(() => undefined)),
+          invalidate: () => Effect.void,
+        }),
+        Layer.succeed(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.suspend(() => {
+              if (new URL(request.url).pathname.endsWith("/auth-files")) {
+                const listing = HttpClientResponse.fromWeb(
+                  request,
+                  Response.json({
+                    files: [
+                      {
+                        id: "first.json",
+                        auth_index: "a",
+                        provider: "codex",
+                        ...(listsIdentity
+                          ? {
+                              email: "first@example.com",
+                              id_token: { chatgpt_account_id: workspace },
+                            }
+                          : {}),
+                      },
+                    ],
+                  }),
+                );
+                return Effect.as(stalled, listing);
+              }
+              const usage = {
+                plan_type: "pro",
+                rate_limit: {
+                  secondary_window: {
+                    used_percent: 78,
+                    reset_at: 4070908800,
+                    limit_window_seconds: 604800,
+                  },
                 },
-              },
-            };
-            return HttpClientResponse.fromWeb(
-              request,
-              Response.json(
-                refused
-                  ? { status_code: 429, body: "{}" }
-                  : { status_code: 200, body: JSON.stringify(usage) },
-              ),
-            );
-          }),
+              };
+              return Effect.succeed(
+                HttpClientResponse.fromWeb(
+                  request,
+                  Response.json(
+                    refused
+                      ? { status_code: 429, header: { "Retry-After": ["89"] }, body: "{}" }
+                      : { status_code: 200, body: JSON.stringify(usage) },
+                  ),
+                ),
+              );
+            }),
+          ),
         ),
-      ),
-      NodeCrypto.layer,
-    ]),
-  );
-});
+        NodeCrypto.layer,
+      ]),
+    );
+  },
+);
 
 const NOW = Date.parse("2026-11-13T12:00:00.000Z");
 const at = (hours: number) => DateTime.formatIso(DateTime.makeUnsafe(NOW + hours * 3_600_000));

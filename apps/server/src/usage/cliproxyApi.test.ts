@@ -58,7 +58,11 @@ function fixture(
       project_id?: string;
       id_token?: { chatgpt_account_id: string; plan_type?: string; chatgpt_plan_type?: string };
     }>;
-    upstream?: (request: RequestBody) => { status: number; body: unknown };
+    upstream?: (request: RequestBody) => {
+      status: number;
+      body: unknown;
+      header?: Record<string, ReadonlyArray<string>>;
+    };
     cooldownStatus?: number;
     models?: (name: string) => Response;
   } = {},
@@ -117,7 +121,11 @@ function fixture(
       };
       return HttpClientResponse.fromWeb(
         request,
-        Response.json({ status_code: upstream.status, body: encodeJson(upstream.body) }),
+        Response.json({
+          status_code: upstream.status,
+          header: upstream.header ?? {},
+          body: encodeJson(upstream.body),
+        }),
       );
     }),
   );
@@ -365,6 +373,93 @@ describe("CLIProxyAPI built-in management API", () => {
       });
       expect(result[1]?.usageLimits.windows[0]?.usedPercent).toBe(12);
       expect(encodeJson(result)).not.toContain("do-not-publish");
+    }),
+  );
+
+  it.effect("sends a refused account no read until its Retry-After passes", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-24T09:00:00.000Z"));
+      let refused = true;
+      const test = fixture({
+        accounts: [
+          { id: "a.json", auth_index: "a", provider: "claude", email: "a@example.com" },
+          { id: "b.json", auth_index: "b", provider: "claude", email: "b@example.com" },
+        ],
+        upstream: (request) =>
+          refused && request.auth_index === "a"
+            ? {
+                status: 429,
+                header: { "Retry-After": ["89"] },
+                body: { error: { type: "rate_limit_error" } },
+              }
+            : { status: 200, body: { five_hour: { utilization: 12, resets_at: null } } },
+      });
+      const api = yield* test.api;
+      const read = Effect.gen(function* () {
+        const sent = test.requests.length;
+        const result = yield* api.readAccounts(config);
+        return {
+          unavailable: result.map((account) => account.usageLimits.unavailable),
+          upstream: test.requests.slice(sent).flatMap(({ body }) => body?.auth_index ?? []),
+        };
+      });
+      const waiting = {
+        reason: "probeFailed",
+        message: "The provider refused the hub request (HTTP 429).",
+        retryAt: "2026-11-24T09:01:29.000Z",
+      };
+      expect(yield* read).toEqual({ unavailable: [waiting, undefined], upstream: ["a", "b"] });
+      refused = false;
+      yield* TestClock.adjust("88 seconds");
+      // Only the refused login waits; the wait keeps counting down to the same moment.
+      expect(yield* read).toEqual({ unavailable: [waiting, undefined], upstream: ["b"] });
+      yield* TestClock.adjust("1 second");
+      expect(yield* read).toEqual({ unavailable: [undefined, undefined], upstream: ["a", "b"] });
+    }),
+  );
+
+  it.effect.each([
+    {
+      name: "an HTTP-date",
+      status: 429,
+      header: { "retry-after": ["Tue, 24 Nov 2026 09:02:00 GMT"] },
+      retryAt: "2026-11-24T09:02:00.000Z",
+    },
+    {
+      name: "an asctime date, which is UTC",
+      status: 429,
+      header: { "Retry-After": ["Tue Nov 24 09:02:00 2026"] },
+      retryAt: "2026-11-24T09:02:00.000Z",
+    },
+    { name: "a default without the header", status: 429, retryAt: "2026-11-24T09:01:00.000Z" },
+    {
+      name: "a default for an unreadable value",
+      status: 429,
+      header: { "Retry-After": ["soon"] },
+      retryAt: "2026-11-24T09:01:00.000Z",
+    },
+    {
+      name: "at most an hour",
+      status: 503,
+      header: { "Retry-After": ["86400"] },
+      retryAt: "2026-11-24T10:00:00.000Z",
+    },
+    { name: "nothing for a refusal that names no wait", status: 401, retryAt: undefined },
+  ])("waits $name after a refused read", ({ status, header, retryAt }) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-24T09:00:00.000Z"));
+      const test = fixture({
+        accounts: [{ id: "a.json", auth_index: "a", provider: "claude", email: "a@example.com" }],
+        upstream: () => ({ status, body: {}, ...(header ? { header } : {}) }),
+      });
+      const api = yield* test.api;
+      const [account] = yield* api.readAccounts(config);
+      expect(account?.usageLimits.unavailable?.retryAt).toBe(retryAt);
+      const sent = test.requests.filter((request) => request.body).length;
+      yield* api.readAccounts(config);
+      expect(test.requests.filter((request) => request.body).length - sent).toBe(
+        retryAt === undefined ? 1 : 0,
+      );
     }),
   );
 

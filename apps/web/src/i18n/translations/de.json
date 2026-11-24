@@ -12796,5 +12796,8 @@
     ")"
   ],
   "33d18dda74f6d7b3": "Auto-Merge für Stack abbrechen",
-  "012c67c7f1a99e33": "Auto-Merge für Stack"
+  "012c67c7f1a99e33": "Auto-Merge für Stack",
+  "0f606a79a0cd6084": "neuer Versuch möglich in {duration}",
+  "60ae4604597d789b": "zuletzt gelesen {time}",
+  "6ee8e716f6b1f298": "{provider}-Limits nicht verfügbar: {reason}"
 }

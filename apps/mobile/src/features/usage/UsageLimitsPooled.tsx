@@ -16,11 +16,13 @@ import {
   collectExternalUsageLinks,
   collectLimitNotices,
   cursorUsageWindowDetails,
+  type LimitNoticeRow,
+  limitNoticeRowText,
 } from "@t3tools/shared/usageLimitsCopy";
 import { msg, T, useGT, useMessages, Var } from "gt-react-native";
 import { Fragment, type ReactNode, useId, useState } from "react";
 import { Pressable, View } from "react-native";
-import { useNowMinuteMs } from "../../lib/clock";
+import { useDeadlinePassed, useNowMinuteMs } from "../../lib/clock";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { ScreenScrollView as ScrollView } from "../../components/ui/ScreenScrollView";
 import { Defs, Path, Pattern, Rect, Svg } from "react-native-svg";
@@ -32,6 +34,7 @@ import { ProviderIcon } from "../../components/ProviderIcon";
 import type { MessageResolver } from "../../i18n/messages";
 import { SettingsScreen } from "../settings/components/SettingsScreen";
 import { environmentPresentations } from "../../state/presentation";
+import { useVisibleSecondClock } from "../threads/use-visible-second-clock";
 import { refillLabel, ResetCredits, resetLabels } from "./UsageLimitsSection";
 import { usageProviderKind, useProviderColors } from "./usageProviders";
 
@@ -566,9 +569,12 @@ export function UsageLimitsSection({
           />
           <View className="min-w-0 flex-1 gap-0.5">
             {notices.map((notice) => (
-              <Text key={notice} className="text-sm font-t3-medium text-warning-foreground">
-                {notice}
-              </Text>
+              <Fragment key={notice.text}>
+                <Text className="text-sm font-t3-medium text-warning-foreground">
+                  {notice.text}
+                </Text>
+                {notice.rows.length > 0 ? <LimitNoticeRows rows={notice.rows} /> : null}
+              </Fragment>
             ))}
             {failedLabels.length > 0 ? (
               <Text className="text-sm font-t3-medium text-warning-foreground">
@@ -583,6 +589,33 @@ export function UsageLimitsSection({
       ) : null}
     </View>
   );
+}
+
+function LimitNoticeRows({ rows }: { readonly rows: readonly LimitNoticeRow[] }) {
+  const m = useMessages();
+  const lastRetryAt = Math.max(
+    ...rows.flatMap((row) => (row.retryAt === undefined ? [] : [Date.parse(row.retryAt)])),
+  );
+  // Ticks only while a wait is still running.
+  const waitOver = useDeadlinePassed(Number.isFinite(lastRetryAt) ? lastRetryAt : null);
+  const now = useVisibleSecondClock(Number.isFinite(lastRetryAt) && !waitOver);
+  const clockTime = (isoDate: string) =>
+    new Date(isoDate).toLocaleString(
+      undefined,
+      new Date(isoDate).toDateString() === new Date(now).toDateString()
+        ? { timeStyle: "short" }
+        : { dateStyle: "medium", timeStyle: "short" },
+    );
+  return rows.map((row) => (
+    <Text
+      key={row.key}
+      // The countdown changes every second; the alert around it must not announce each tick.
+      accessibilityLiveRegion="none"
+      className="pl-3 text-sm tabular-nums text-warning-foreground"
+    >
+      {limitNoticeRowText(row, now, clockTime, m)}
+    </Text>
+  ));
 }
 
 type AccountScreenProps = StaticScreenProps<{

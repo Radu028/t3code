@@ -58,7 +58,12 @@ const AuthFiles = Schema.Struct({ files: Schema.Array(AuthFile) });
 const AuthFileModels = Schema.Struct({
   models: Schema.Array(Schema.Struct({ id: Schema.String })),
 });
-const ApiResponse = Schema.Struct({ status_code: Schema.Number, body: Schema.String });
+const ApiResponse = Schema.Struct({
+  status_code: Schema.Number,
+  body: Schema.String,
+  // The upstream response's headers, each as a list of values; a hub may send none.
+  header: Schema.optional(Schema.NullOr(Schema.Record(Schema.String, Schema.Unknown))),
+});
 const CodexWindow = Schema.Struct({
   used_percent: Schema.Number,
   reset_at: Schema.optional(Schema.NullOr(Schema.Number)),
@@ -131,6 +136,46 @@ const decodeGrokUsage = Schema.decodeUnknownEffect(Schema.fromJsonString(GrokUsa
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const isUsageLimitSourceError = Schema.is(UsageLimitSourceError);
 
+/** The provider answered the hub's upstream call with a status outside 2xx. */
+class HubUpstreamRefusal extends Schema.TaggedError<HubUpstreamRefusal>()("HubUpstreamRefusal", {
+  status: Schema.Number,
+  /** Epoch milliseconds before which the provider asked for no further call. */
+  retryAt: Schema.optional(Schema.Number),
+}) {
+  override get message(): string {
+    return `The provider refused the hub request (HTTP ${this.status}).`;
+  }
+}
+const isHubUpstreamRefusal = Schema.is(HubUpstreamRefusal);
+
+const RETRY_AFTER_DEFAULT_MS = 60_000;
+const RETRY_AFTER_MAX_MS = 60 * 60_000;
+
+/**
+ * When a refused upstream call may be tried again. Retry-After is delay-seconds or an HTTP-date;
+ * a 429 without a usable one waits a default, and no wait exceeds an hour.
+ */
+function upstreamRetryAt(response: typeof ApiResponse.Type, now: number): number | undefined {
+  const values = Object.entries(response.header ?? {}).find(
+    ([name]) => name.toLowerCase() === "retry-after",
+  )?.[1];
+  const value: unknown = Array.isArray(values) ? values[0] : values;
+  const text = typeof value === "string" ? value.trim() : "";
+  const asked = /^\d+$/.test(text)
+    ? Number(text) * 1_000
+    : // Date.parse also accepts bare numbers and partial dates; an HTTP-date starts with a day name.
+      // Its asctime form names no zone and means UTC, where Date.parse would assume local time.
+      /^[a-z]{3}/i.test(text)
+      ? Date.parse(/\bGMT$/i.test(text) ? text : `${text} GMT`) - now
+      : Number.NaN;
+  const wait = Number.isFinite(asked)
+    ? asked
+    : response.status_code === 429
+      ? RETRY_AFTER_DEFAULT_MS
+      : 0;
+  return wait > 0 ? now + Math.min(wait, RETRY_AFTER_MAX_MS) : undefined;
+}
+
 // Extra CAs can fix untrusted chains; expiry/hostname failures report codes only.
 const UNTRUSTED_CERTIFICATE_CODES = new Set([
   "DEPTH_ZERO_SELF_SIGNED_CERT",
@@ -198,11 +243,9 @@ const creditRedeemRequestId = Effect.fn("CliproxyApi.creditRedeemRequestId")(fun
 });
 
 type AuthFile = typeof AuthFile.Type;
+type HubCallError = UsageLimitSourceError | HubUpstreamRefusal | Schema.SchemaError;
 /** Sends one upstream request with the account's token, as GET or as a JSON POST of `data`. */
-type HubCall = (
-  url: string,
-  data?: unknown,
-) => Effect.Effect<string, UsageLimitSourceError | Schema.SchemaError>;
+type HubCall = (url: string, data?: unknown) => Effect.Effect<string, HubCallError>;
 type HubReading = Omit<UsageLimitSourceAccount, "id" | "driver">;
 interface HubProvider {
   readonly driver: ProviderDriverKind;
@@ -215,7 +258,7 @@ interface HubProvider {
     readonly account: AuthFile;
     readonly call: HubCall;
     readonly checkedAt: string;
-  }) => Effect.Effect<HubReading, UsageLimitSourceError | Schema.SchemaError, Digest.Digest>;
+  }) => Effect.Effect<HubReading, HubCallError, Digest.Digest>;
 }
 
 const listedIdentity = (account: AuthFile) => ({
@@ -408,12 +451,12 @@ export const makeCliproxyApi = Effect.gen(function* () {
   const platform = yield* HostProcess.Platform;
   const architecture = yield* HostProcess.Architecture;
 
-  const management = Effect.fn("CliproxyApi.management")(function* (
-    hub: CliproxyHub,
-    path: string,
-    body?: unknown,
-  ) {
-    const url = yield* Effect.try({
+  // A login the provider told to wait is not read again until then. Other environments reading the
+  // same hub share the provider's limit, so a read sent early keeps every one of them refused.
+  const cooldowns = new Map<string, { readonly until: number; readonly message: string }>();
+
+  const managementUrl = (hub: CliproxyHub, path: string) =>
+    Effect.try({
       try: () => {
         const base = new URL(hub.url);
         // Users often paste the hub's web panel URL, which ends in management.html.
@@ -422,6 +465,13 @@ export const makeCliproxyApi = Effect.gen(function* () {
       },
       catch: () => new UsageLimitSourceError({ detail: "The hub URL is not valid." }),
     });
+
+  const management = Effect.fn("CliproxyApi.management")(function* (
+    hub: CliproxyHub,
+    path: string,
+    body?: unknown,
+  ) {
+    const url = yield* managementUrl(hub, path);
     const request = (
       body === undefined ? HttpClientRequest.get(url) : HttpClientRequest.post(url)
     ).pipe(HttpClientRequest.setHeader("Authorization", `Bearer ${hub.managementKey}`));
@@ -473,8 +523,10 @@ export const makeCliproxyApi = Effect.gen(function* () {
     });
     const response = yield* decodeApiResponse(raw);
     if (response.status_code < 200 || response.status_code >= 300) {
-      return yield* new UsageLimitSourceError({
-        detail: `The provider refused the hub request (HTTP ${response.status_code}).`,
+      const retryAt = upstreamRetryAt(response, DateTime.toEpochMillis(yield* DateTime.now));
+      return yield* new HubUpstreamRefusal({
+        status: response.status_code,
+        ...(retryAt === undefined ? {} : { retryAt }),
       });
     }
     return response.body;
@@ -482,29 +534,56 @@ export const makeCliproxyApi = Effect.gen(function* () {
 
   const readAccount = Effect.fn("CliproxyApi.readAccount")(function* (
     hub: CliproxyHub,
+    hubKey: string,
     account: AuthFile,
     provider: HubProvider,
   ) {
-    const checkedAt = DateTime.formatIso(yield* DateTime.now);
+    const now = yield* DateTime.now;
+    const checkedAt = DateTime.formatIso(now);
+    const login = listedIdentity(account);
+    // Messages are credential-free: a status code or a fixed sentence.
+    const unreadable = (message: string, retryAt?: number) => ({
+      id: account.id,
+      driver: provider.driver,
+      ...login,
+      usageLimits: makeUnavailableUsageLimits({
+        checkedAt,
+        reason: "probeFailed",
+        message,
+        retryAt:
+          retryAt === undefined ? undefined : DateTime.formatIso(DateTime.makeUnsafe(retryAt)),
+      }),
+    });
+    // An auth file can be given another login, which the provider has not told to wait.
+    const cooldownKey = [hubKey, account.auth_index, login.email, login.workspaceId].join("\n");
+    const cooldown = cooldowns.get(cooldownKey);
+    if (cooldown && cooldown.until > DateTime.toEpochMillis(now)) {
+      return unreadable(cooldown.message, cooldown.until);
+    }
+    cooldowns.delete(cooldownKey);
     const call: HubCall = (url, data) =>
       apiCall(hub, account, provider.header(account, platform, architecture), url, data);
-    const reading = yield* provider.read({ account, call, checkedAt }).pipe(
+    return yield* provider.read({ account, call, checkedAt }).pipe(
       Effect.provideService(Digest.Digest, digest),
+      Effect.map((reading) => ({ id: account.id, driver: provider.driver, ...reading })),
       Effect.catch((error) =>
-        Effect.succeed({
-          ...listedIdentity(account),
-          usageLimits: makeUnavailableUsageLimits({
-            checkedAt,
-            reason: "probeFailed",
-            // Source-error details are already credential-free (status codes only).
-            message: isUsageLimitSourceError(error)
+        Effect.sync(() => {
+          if (isHubUpstreamRefusal(error)) {
+            if (error.retryAt !== undefined) {
+              // Two sources may name one hub; the read that answers last must not shorten the wait.
+              const until = Math.max(error.retryAt, cooldowns.get(cooldownKey)?.until ?? 0);
+              cooldowns.set(cooldownKey, { until, message: error.message });
+            }
+            return unreadable(error.message, error.retryAt);
+          }
+          return unreadable(
+            isUsageLimitSourceError(error)
               ? error.detail
               : "The hub could not read this account's usage.",
-          }),
+          );
         }),
       ),
     );
-    return { id: account.id, driver: provider.driver, ...reading };
   });
 
   const readAccounts = Effect.fn("CliproxyApi.readAccounts")(function* (
@@ -517,6 +596,12 @@ export const makeCliproxyApi = Effect.gen(function* () {
           : new UsageLimitSourceError({ detail: "The hub could not list accounts." }),
       ),
     );
+    const hubKey = yield* managementUrl(hub, "");
+    const now = DateTime.toEpochMillis(yield* DateTime.now);
+    // A login removed from the hub while waiting is never read again, so its entry is dropped here.
+    for (const [key, cooldown] of cooldowns) {
+      if (cooldown.until <= now) cooldowns.delete(key);
+    }
     const readable = accounts.flatMap((account) => {
       const provider = HUB_PROVIDERS.get(account.provider);
       return provider && !account.disabled ? [{ account, provider }] : [];
@@ -525,9 +610,11 @@ export const makeCliproxyApi = Effect.gen(function* () {
     // short deadline; a slow lookup must not push a refresh past its budget.
     const [readings, models] = yield* Effect.all(
       [
-        Effect.forEach(readable, ({ account, provider }) => readAccount(hub, account, provider), {
-          concurrency: 4,
-        }),
+        Effect.forEach(
+          readable,
+          ({ account, provider }) => readAccount(hub, hubKey, account, provider),
+          { concurrency: 4 },
+        ),
         Effect.forEach(
           readable,
           ({ account }) =>
@@ -599,7 +686,9 @@ export const makeCliproxyApi = Effect.gen(function* () {
         isUsageLimitSourceError(error)
           ? error
           : new UsageLimitSourceError({
-              detail: "The hub returned an unexpected reset-credit response.",
+              detail: isHubUpstreamRefusal(error)
+                ? error.message
+                : "The hub returned an unexpected reset-credit response.",
             }),
       ),
     );

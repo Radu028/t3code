@@ -451,10 +451,27 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   return [...accounts.values()];
 }
 
-/** Hub accounts whose read failed and that no other report shows as a row, with their names. */
+export interface FailedHubAccount {
+  readonly key: string;
+  readonly driver: ServerProvider["driver"];
+  readonly name: string;
+  readonly sourceLabel: string;
+  /** Labels of the environments whose hub reported the failure. */
+  readonly environments: readonly string[];
+  /** The newest failed report, which supplies the reason. */
+  readonly limits: ServerProviderUsageLimits;
+  /** When the first reporting environment may read again; a refresh after it sends a read. */
+  readonly retryAt: string | undefined;
+  readonly lastReadAt: string | undefined;
+}
+
+/**
+ * Hub accounts whose read failed and that no other report shows as a row. Environments that read
+ * one hub report each of its logins once; a hub only its own machine reaches stays apart.
+ */
 export function unshownFailedHubAccounts(
   presentations: LimitPresentations,
-): ReadonlyMap<UsageLimitSourceAccount, string> {
+): readonly FailedHubAccount[] {
   const resolveKey = limitAccountKeyResolver(presentations);
   const shownRows = new Set<string>();
   for (const [environmentId, presentation] of presentations) {
@@ -471,17 +488,44 @@ export function unshownFailedHubAccounts(
       }
     }
   }
-  const failed = new Map<UsageLimitSourceAccount, string>();
+  const pick = (order: "earlier" | "later", left: string | undefined, right: string | undefined) =>
+    left === undefined || right === undefined
+      ? (left ?? right)
+      : Date.parse(left) > Date.parse(right) === (order === "later")
+        ? left
+        : right;
+  const failed = new Map<string, FailedHubAccount>();
   for (const [environmentId, presentation] of presentations) {
+    const environment = presentation.entry.target.label;
     for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
       for (const account of source.accounts) {
-        if (account.usageLimits.unavailable?.reason !== "probeFailed") continue;
+        const failure = account.usageLimits.unavailable;
+        if (failure?.reason !== "probeFailed") continue;
         if (shownRows.has(hubRowKey(resolveKey, environmentId, source, account))) continue;
-        failed.set(account, account.email ?? hubAccountName(account));
+        const login =
+          resolveKey(account) ??
+          `${account.id}${account.workspaceId ? `:${account.workspaceId}` : ""}`;
+        const key = `${hubIdentity(environmentId, source)}\n${login}`;
+        const previous = failed.get(key);
+        const newer =
+          !previous ||
+          Date.parse(account.usageLimits.checkedAt) > Date.parse(previous.limits.checkedAt);
+        failed.set(key, {
+          key,
+          driver: account.driver,
+          name: previous?.name ?? account.email ?? hubAccountName(account),
+          sourceLabel: previous?.sourceLabel ?? source.label,
+          environments: previous?.environments.includes(environment)
+            ? previous.environments
+            : [...(previous?.environments ?? []), environment],
+          limits: newer ? account.usageLimits : previous.limits,
+          retryAt: pick("earlier", previous?.retryAt, failure.retryAt),
+          lastReadAt: pick("later", previous?.lastReadAt, failure.lastReadAt),
+        });
       }
     }
   }
-  return failed;
+  return [...failed.values()];
 }
 
 export interface LimitPoolMember {

@@ -1,11 +1,14 @@
-import type {
-  ProviderConsumeResetCreditInput,
-  ServerProviderResetCredits,
-  ServerProviderUsageLimits,
-  ServerProviderUsageWindow,
+import {
+  PROVIDER_DISPLAY_NAMES,
+  type ProviderConsumeResetCreditInput,
+  type ServerProviderResetCredits,
+  type ServerProviderUsageLimits,
+  type ServerProviderUsageWindow,
 } from "@t3tools/contracts";
 import { mFallback, msg } from "gt-i18n";
 import type { MFunctionType } from "gt-i18n/types";
+
+import { formatDuration as formatElapsed } from "./orchestrationTimingCopy.ts";
 
 import {
   collectExternalUsageLinks as collectExternalUsageLinksWith,
@@ -79,16 +82,65 @@ export function limitsNotice(
   return limits.windows.length === 0 ? resolve(msg("No limits reported.")) : null;
 }
 
+/** A failed hub account under a notice. Its times are formatted when shown, as the wait counts down. */
+export interface LimitNoticeRow {
+  readonly key: string;
+  readonly label: string;
+  readonly retryAt: string | undefined;
+  readonly lastReadAt: string | undefined;
+}
+
+export interface LimitNotice {
+  readonly text: string;
+  readonly rows: readonly LimitNoticeRow[];
+}
+
+/** @public */
+export function limitNoticeRowText(
+  row: LimitNoticeRow,
+  now: number,
+  formatTime: (isoDate: string) => string,
+  resolve: MFunctionType = mFallback,
+): string {
+  const wait = row.retryAt === undefined ? 0 : Date.parse(row.retryAt) - now;
+  return [
+    row.label,
+    ...(wait > 0
+      ? [
+          resolve(
+            msg("can retry in {duration}", {
+              duration: formatElapsed(Math.ceil(wait / 1_000) * 1_000, resolve),
+              $context: "time until a refresh may read these usage limits again",
+            }),
+          ),
+        ]
+      : []),
+    ...(row.lastReadAt === undefined
+      ? []
+      : [
+          resolve(
+            msg("last read {time}", {
+              time: formatTime(row.lastReadAt),
+              $context: "clock time usage limits were last read",
+            }),
+          ),
+        ]),
+  ].join(" · ");
+}
+
 /** @public */
 export function collectLimitNotices(
   presentations: LimitPresentations,
   resolve: MFunctionType = mFallback,
-): readonly string[] {
+): readonly LimitNotice[] {
   const label = (environmentLabel: string, subject: string) =>
     presentations.size > 1 ? `${environmentLabel} · ${subject}` : subject;
-  const notices = new Set<string>();
-  // A failed hub read needs no notice when another report already shows the account's row.
-  const failedAccounts = unshownFailedHubAccounts(presentations);
+  const notices = new Map<string, { readonly text: string; readonly rows: LimitNoticeRow[] }>();
+  const add = (text: string) => {
+    const notice = notices.get(text) ?? { text, rows: [] };
+    notices.set(text, notice);
+    return notice;
+  };
   for (const presentation of presentations.values()) {
     const environmentLabel = presentation.entry.target.label;
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
@@ -102,13 +154,13 @@ export function collectLimitNotices(
       }
       const notice = limits ? limitsNotice(limits, resolve) : null;
       const name = provider.displayName?.trim() || String(provider.driver);
-      if (notice) notices.add(`${label(environmentLabel, name)}: ${notice}`);
+      if (notice) add(`${label(environmentLabel, name)}: ${notice}`);
     }
     for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
       if (source.error) {
-        notices.add(`${label(environmentLabel, source.label)}: ${source.error}`);
+        add(`${label(environmentLabel, source.label)}: ${source.error}`);
       } else if (source.accounts.length === 0) {
-        notices.add(
+        add(
           resolve(
             msg("{source}: No accounts reported.", {
               source: label(environmentLabel, source.label),
@@ -116,15 +168,28 @@ export function collectLimitNotices(
           ),
         );
       }
-      for (const account of source.accounts) {
-        const name = failedAccounts.get(account);
-        if (name === undefined) continue;
-        const notice = limitsNotice(account.usageLimits, resolve);
-        notices.add(`${label(environmentLabel, source.label)} · ${name}: ${notice}`);
-      }
     }
   }
-  return [...notices];
+  // A failed hub read needs no notice when another report already shows the account's row.
+  for (const account of unshownFailedHubAccounts(presentations)) {
+    const heading = resolve(
+      msg("{provider} limits unavailable: {reason}", {
+        provider: PROVIDER_DISPLAY_NAMES[account.driver] ?? String(account.driver),
+        reason: limitsNotice(account.limits, resolve) ?? "",
+      }),
+    );
+    add(heading).rows.push({
+      key: account.key,
+      label: [
+        account.name,
+        account.sourceLabel,
+        ...(presentations.size > 1 ? [account.environments.join(", ")] : []),
+      ].join(" · "),
+      retryAt: account.retryAt,
+      lastReadAt: account.lastReadAt,
+    });
+  }
+  return [...notices.values()];
 }
 
 /** @public */
