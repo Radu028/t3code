@@ -34,6 +34,7 @@ import { ProviderIcon } from "../../components/ProviderIcon";
 import type { MessageResolver } from "../../i18n/messages";
 import { SettingsScreen } from "../settings/components/SettingsScreen";
 import { environmentPresentations } from "../../state/presentation";
+import { useMessageTimeFormatter } from "../threads/useMessageTimeFormatter";
 import { useVisibleSecondClock } from "../threads/use-visible-second-clock";
 import { refillLabel, ResetCredits, resetLabels } from "./UsageLimitsSection";
 import { usageProviderKind, useProviderColors } from "./usageProviders";
@@ -593,21 +594,19 @@ export function UsageLimitsSection({
 
 function LimitNoticeRows({ rows }: { readonly rows: readonly LimitNoticeRow[] }) {
   const m = useMessages();
+  const formatTime = useMessageTimeFormatter();
+  // A time that does not parse is left out, or it would turn the latest wait into NaN.
   const lastRetryAt = Math.max(
-    ...rows.flatMap((row) => (row.retryAt === undefined ? [] : [Date.parse(row.retryAt)])),
+    ...rows.flatMap((row) => {
+      const retryAt = Date.parse(row.retryAt ?? "");
+      return Number.isNaN(retryAt) ? [] : [retryAt];
+    }),
   );
   // Ticks only while a wait is still running.
   const waitOver = useDeadlinePassed(Number.isFinite(lastRetryAt) ? lastRetryAt : null);
   const tick = useVisibleSecondClock(Number.isFinite(lastRetryAt) && !waitOver);
   // The tick is floored to the second, so it can still read just short of a wait that is over.
   const now = waitOver ? Math.max(tick, lastRetryAt) : tick;
-  const clockTime = (isoDate: string) =>
-    new Date(isoDate).toLocaleString(
-      undefined,
-      new Date(isoDate).toDateString() === new Date(now).toDateString()
-        ? { timeStyle: "short" }
-        : { dateStyle: "medium", timeStyle: "short" },
-    );
   return rows.map((row) => (
     <Text
       key={row.key}
@@ -615,7 +614,7 @@ function LimitNoticeRows({ rows }: { readonly rows: readonly LimitNoticeRow[] })
       accessibilityLiveRegion="none"
       className="pl-3 text-sm tabular-nums text-warning-foreground"
     >
-      {limitNoticeRowText(row, now, clockTime, m)}
+      {limitNoticeRowText(row, now, (isoDate) => formatTime(isoDate, now), m)}
     </Text>
   ));
 }
