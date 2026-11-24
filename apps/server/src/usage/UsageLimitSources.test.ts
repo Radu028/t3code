@@ -211,9 +211,12 @@ it.effect(
           lastReadAt: "2026-11-24T09:00:00.000Z",
         },
       });
+      // A caller that stops waiting does not stop the refresh, whose answer is still shown.
+      yield* Fiber.interrupt(slowRefresh);
       stalled = Effect.void;
       yield* Deferred.succeed(hubAnswers, undefined);
-      yield* Fiber.join(slowRefresh);
+      yield* TestClock.adjust("1 second");
+      expect((yield* shown)?.checkedAt).toBe("2026-11-24T09:00:30.000Z");
       // Later failures keep naming the last real read and never bring the reading back.
       yield* TestClock.adjust("2 minutes");
       expect(yield* read).toMatchObject({
@@ -222,7 +225,7 @@ it.effect(
       });
       refused = false;
       yield* TestClock.adjust("2 minutes");
-      expect((yield* read)?.checkedAt).toBe("2026-11-24T09:04:30.000Z");
+      expect((yield* read)?.checkedAt).toBe("2026-11-24T09:04:31.000Z");
       refused = true;
       // The same auth file now holds another login, whose reading is unknown.
       workspace = "account-b";

@@ -187,9 +187,10 @@ The hub's Codex, Claude, xAI (shown as Grok) and Antigravity accounts appear und
 accounts for other providers are not read. Codex accounts show banked reset credits; select an
 account and choose **Use reset** to redeem one. No hub plugin is required.
 
-When a provider refuses to report an account's limits, Limits lists the account as unavailable
-instead of showing its earlier numbers. If the provider asked for a wait, the notice counts it
-down and refreshing does not ask again until it ends.
+When a provider refuses to report an account's limits, Limits stops showing the account's earlier
+numbers within 30 seconds and lists it as unavailable, unless another environment still reads it.
+If the provider asked for a wait, the notice counts it down and refreshing that environment does
+not ask again until it ends.
 
 This connection supplies usage information; configure
 the provider separately to send agent requests through the hub. A thread uses the hub's limits and

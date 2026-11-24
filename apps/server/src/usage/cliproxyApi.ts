@@ -168,7 +168,8 @@ function upstreamRetryAt(response: typeof ApiResponse.Type, now: number): number
       /^[a-z]{3}/i.test(text)
       ? Date.parse(/\bGMT$/i.test(text) ? text : `${text} GMT`) - now
       : Number.NaN;
-  const wait = Number.isFinite(asked)
+  // A delay too long for a number is still a delay, and takes the cap.
+  const wait = !Number.isNaN(asked)
     ? asked
     : response.status_code === 429
       ? RETRY_AFTER_DEFAULT_MS
@@ -453,7 +454,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
 
   // A login the provider told to wait is not read again until then. Other environments reading the
   // same hub share the provider's limit, so a read sent early keeps every one of them refused.
-  const cooldowns = new Map<string, { readonly until: number; readonly message: string }>();
+  const cooldowns = new Map<string, { readonly until: number; readonly status: number }>();
 
   const managementUrl = (hub: CliproxyHub, path: string) =>
     Effect.try({
@@ -538,8 +539,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
     account: AuthFile,
     provider: HubProvider,
   ) {
-    const now = yield* DateTime.now;
-    const checkedAt = DateTime.formatIso(now);
+    const checkedAt = DateTime.formatIso(yield* DateTime.now);
     const login = listedIdentity(account);
     // Messages are credential-free: a status code or a fixed sentence.
     const unreadable = (message: string, retryAt?: number) => ({
@@ -556,25 +556,28 @@ export const makeCliproxyApi = Effect.gen(function* () {
     });
     // An auth file can be given another login, which the provider has not told to wait.
     const cooldownKey = [hubKey, account.auth_index, login.email, login.workspaceId].join("\n");
-    const cooldown = cooldowns.get(cooldownKey);
-    if (cooldown && cooldown.until > DateTime.toEpochMillis(now)) {
-      return unreadable(cooldown.message, cooldown.until);
-    }
-    cooldowns.delete(cooldownKey);
+    // Every upstream request of a read passes here, so a read already under way also stops once
+    // another read of the same login is told to wait.
     const call: HubCall = (url, data) =>
-      apiCall(hub, account, provider.header(account, platform, architecture), url, data);
+      Effect.flatMap(DateTime.now, (sentAt) => {
+        const cooldown = cooldowns.get(cooldownKey);
+        return cooldown && cooldown.until > DateTime.toEpochMillis(sentAt)
+          ? Effect.fail(
+              new HubUpstreamRefusal({ status: cooldown.status, retryAt: cooldown.until }),
+            )
+          : apiCall(hub, account, provider.header(account, platform, architecture), url, data);
+      });
     return yield* provider.read({ account, call, checkedAt }).pipe(
       Effect.provideService(Digest.Digest, digest),
       Effect.map((reading) => ({ id: account.id, driver: provider.driver, ...reading })),
       Effect.catch((error) =>
         Effect.sync(() => {
           if (isHubUpstreamRefusal(error)) {
-            if (error.retryAt !== undefined) {
-              // Two sources may name one hub; the read that answers last must not shorten the wait.
-              const until = Math.max(error.retryAt, cooldowns.get(cooldownKey)?.until ?? 0);
-              cooldowns.set(cooldownKey, { until, message: error.message });
-            }
-            return unreadable(error.message, error.retryAt);
+            if (error.retryAt === undefined) return unreadable(error.message);
+            // Two sources may name one hub; the read that answers last must not shorten the wait.
+            const until = Math.max(error.retryAt, cooldowns.get(cooldownKey)?.until ?? 0);
+            cooldowns.set(cooldownKey, { until, status: error.status });
+            return unreadable(error.message, until);
           }
           return unreadable(
             isUsageLimitSourceError(error)

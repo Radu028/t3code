@@ -18,6 +18,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Fiber from "effect/Fiber";
 import * as FiberHandle from "effect/FiberHandle";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
@@ -307,10 +308,13 @@ export const make = Effect.gen(function* () {
 
   yield* refresh.pipe(Effect.forkScoped);
 
+  const scope = yield* Effect.scope;
   return {
     current: Ref.get(stateRef),
     consumeResetCredit,
-    refresh,
+    // A caller may stop waiting, as the reset fallback does after five seconds. The refresh still
+    // runs to its end, so a refusal it met reaches the shown state.
+    refresh: refresh.pipe(Effect.forkIn(scope), Effect.flatMap(Fiber.join)),
     get streamChanges() {
       return Stream.unwrap(
         Effect.gen(function* () {

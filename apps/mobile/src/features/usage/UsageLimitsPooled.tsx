@@ -598,7 +598,9 @@ function LimitNoticeRows({ rows }: { readonly rows: readonly LimitNoticeRow[] })
   );
   // Ticks only while a wait is still running.
   const waitOver = useDeadlinePassed(Number.isFinite(lastRetryAt) ? lastRetryAt : null);
-  const now = useVisibleSecondClock(Number.isFinite(lastRetryAt) && !waitOver);
+  const tick = useVisibleSecondClock(Number.isFinite(lastRetryAt) && !waitOver);
+  // The tick is floored to the second, so it can still read just short of a wait that is over.
+  const now = waitOver ? Math.max(tick, lastRetryAt) : tick;
   const clockTime = (isoDate: string) =>
     new Date(isoDate).toLocaleString(
       undefined,

@@ -444,6 +444,12 @@ describe("CLIProxyAPI built-in management API", () => {
       header: { "Retry-After": ["86400"] },
       retryAt: "2026-11-24T10:00:00.000Z",
     },
+    {
+      name: "at most an hour for a delay too long to count",
+      status: 503,
+      header: { "Retry-After": ["9".repeat(400)] },
+      retryAt: "2026-11-24T10:00:00.000Z",
+    },
     { name: "nothing for a refusal that names no wait", status: 401, retryAt: undefined },
   ])("waits $name after a refused read", ({ status, header, retryAt }) =>
     Effect.gen(function* () {
